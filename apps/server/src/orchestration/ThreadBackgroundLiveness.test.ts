@@ -147,6 +147,36 @@ describe("ThreadBackgroundLiveness", () => {
     expect(liveness.getThreadBackgroundLiveness(threadId)).toBeNull();
   });
 
+  it("late progress does not revive an idle task", () => {
+    const liveness = ThreadBackgroundLiveness.make();
+    const threadId = "t-live-late-progress";
+    liveness.recordTaskLiveness({
+      threadId,
+      taskId: "a1",
+      taskType: undefined,
+      status: undefined,
+      kind: "started",
+    });
+    liveness.recordTaskLiveness({
+      threadId,
+      taskId: "a1",
+      taskType: undefined,
+      status: "idle",
+      kind: "updated",
+    });
+    expect(liveness.getThreadBackgroundLiveness(threadId)).toBeNull();
+
+    // Providers can flush delayed progress after the terminal/idle update.
+    liveness.recordTaskLiveness({
+      threadId,
+      taskId: "a1",
+      taskType: undefined,
+      status: undefined,
+      kind: "progress",
+    });
+    expect(liveness.getThreadBackgroundLiveness(threadId)).toBeNull();
+  });
+
   it("plan tasks are inert; clear removes everything; instances are isolated", () => {
     const a = ThreadBackgroundLiveness.make();
     const b = ThreadBackgroundLiveness.make();

@@ -104,6 +104,10 @@ export function make(): ThreadBackgroundLivenessService["Service"] {
   return {
     recordTaskLiveness: (input) => {
       const taskType = input.taskType;
+      const existingState = stateByThreadId.get(input.threadId);
+      const wasLive =
+        existingState?.agents.has(input.taskId) === true ||
+        existingState?.monitors.has(input.taskId) === true;
       if (taskType !== undefined && INERT_TASK_TYPES.has(taskType)) {
         drop(input.threadId, input.taskId);
         return;
@@ -127,6 +131,13 @@ export function make(): ThreadBackgroundLivenessService["Service"] {
         (input.status !== undefined && TERMINAL_STATUSES.has(input.status));
       if (terminal) {
         drop(input.threadId, input.taskId);
+        return;
+      }
+
+      // Ordinary progress is descriptive and carries no lifecycle status. It
+      // can arrive after an idle or terminal update, so it may keep existing
+      // work live but must not create a new live entry by itself.
+      if (input.kind === "progress" && input.status === undefined && !wasLive) {
         return;
       }
 
