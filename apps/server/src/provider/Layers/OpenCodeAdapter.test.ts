@@ -388,6 +388,241 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("sends OpenCode Go models to the runtime as a bare modelID", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-go-deepseek");
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "hello",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode-go/deepseek-v4-pro",
+        ),
+      });
+
+      NodeAssert.deepEqual(runtimeMock.state.promptCalls.at(-1), {
+        sessionID: "http://127.0.0.1:9999/session",
+        model: {
+          providerID: "opencode-go",
+          modelID: "deepseek-v4-pro",
+        },
+        parts: [{ type: "text", text: "hello" }],
+      });
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("strips a duplicated OpenCode Go provider prefix before the runtime request", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-go-doubled");
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "hello",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode-go/opencode-go/deepseek-v4-pro",
+        ),
+      });
+
+      NodeAssert.deepEqual(runtimeMock.state.promptCalls.at(-1), {
+        sessionID: "http://127.0.0.1:9999/session",
+        model: {
+          providerID: "opencode-go",
+          modelID: "deepseek-v4-pro",
+        },
+        parts: [{ type: "text", text: "hello" }],
+      });
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("sends a second OpenCode Go model with the same bare runtime modelID shape", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-go-kimi");
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "hello",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode-go/kimi-k2.7-code",
+        ),
+      });
+
+      NodeAssert.deepEqual(runtimeMock.state.promptCalls.at(-1), {
+        sessionID: "http://127.0.0.1:9999/session",
+        model: {
+          providerID: "opencode-go",
+          modelID: "kimi-k2.7-code",
+        },
+        parts: [{ type: "text", text: "hello" }],
+      });
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("keeps a slash inside a non-OpenCode-Go model ID", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-openrouter-slash");
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "hello",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "openrouter/qwen/qwen3-coder",
+        ),
+      });
+
+      NodeAssert.deepEqual(runtimeMock.state.promptCalls.at(-1), {
+        sessionID: "http://127.0.0.1:9999/session",
+        model: {
+          providerID: "openrouter",
+          modelID: "qwen/qwen3-coder",
+        },
+        parts: [{ type: "text", text: "hello" }],
+      });
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("passes an unknown provider/model slug through without rewriting it", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-custom-opencode-model");
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "hello",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "acme/custom-model",
+        ),
+      });
+
+      NodeAssert.deepEqual(runtimeMock.state.promptCalls.at(-1), {
+        sessionID: "http://127.0.0.1:9999/session",
+        model: {
+          providerID: "acme",
+          modelID: "custom-model",
+        },
+        parts: [{ type: "text", text: "hello" }],
+      });
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("rejects a bare OpenCode model id that is missing the provider namespace", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-bare-opencode-model");
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const error = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "hello",
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("opencode"),
+            "deepseek-v4-pro",
+          ),
+        })
+        .pipe(Effect.flip);
+
+      NodeAssert.equal(error._tag, "ProviderAdapterValidationError");
+      if (error._tag !== "ProviderAdapterValidationError") {
+        throw new Error("Unexpected error type");
+      }
+      NodeAssert.equal(
+        error.issue,
+        "OpenCode model selection must use the 'provider/model' format.",
+      );
+      NodeAssert.deepEqual(runtimeMock.state.promptCalls, []);
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("normalizes a duplicated OpenCode Go slug on the resume sendTurn path", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-go-resume-model");
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+        resumeCursor: { schemaVersion: 1, sessionId: "ses_persisted" },
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode-go/opencode-go/kimi-k2.7-code",
+        ),
+      });
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "continue",
+      });
+
+      NodeAssert.deepEqual(runtimeMock.state.promptCalls.at(-1), {
+        sessionID: "ses_persisted",
+        model: {
+          providerID: "opencode-go",
+          modelID: "kimi-k2.7-code",
+        },
+        parts: [{ type: "text", text: "continue" }],
+      });
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("falls back to a fresh session when the persisted session is gone", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;

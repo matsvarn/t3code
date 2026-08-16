@@ -150,6 +150,32 @@ describe("parseModelsCliOutput", () => {
     NodeAssert.equal(model.id, "qwen/qwen3-coder");
     NodeAssert.equal(model.providerID, "openrouter");
   });
+
+  it("keys OpenCode Go models by the slug suffix even when JSON id is namespaced", () => {
+    const stdout = [
+      "opencode-go/deepseek-v4-pro",
+      JSON.stringify({
+        id: "opencode-go/deepseek-v4-pro",
+        providerID: "opencode-go",
+        name: "DeepSeek V4 Pro",
+        status: "active",
+      }),
+      "opencode-go/kimi-k2.7-code",
+      JSON.stringify({
+        id: "kimi-k2.7-code",
+        providerID: "opencode-go",
+        name: "Kimi K2.7 Code",
+        status: "active",
+      }),
+    ].join("\n");
+
+    const result = parseModelsCliOutput(stdout);
+    const provider = result.providers.get("opencode-go")!;
+    NodeAssert.ok(provider);
+    NodeAssert.deepEqual([...result.connected], ["opencode-go"]);
+    NodeAssert.equal(provider.models["deepseek-v4-pro"]?.id, "opencode-go/deepseek-v4-pro");
+    NodeAssert.equal(provider.models["kimi-k2.7-code"]?.id, "kimi-k2.7-code");
+  });
 });
 
 describe("parseAgentListCliOutput", () => {

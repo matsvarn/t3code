@@ -302,10 +302,16 @@ export function parseOpenCodeModelSlug(
     return null;
   }
 
-  return {
-    providerID: trimmed.slice(0, separator),
-    modelID: trimmed.slice(separator + 1),
-  };
+  const providerID = trimmed.slice(0, separator);
+  let modelID = trimmed.slice(separator + 1);
+  const prefix = `${providerID}/`;
+  // Inventory or persisted slugs can repeat the provider (`opencode-go/opencode-go/…`).
+  // OpenCode looks up `provider.models[modelID]`, so the extra prefix must not ship.
+  while (modelID.startsWith(prefix) && modelID.length > prefix.length) {
+    modelID = modelID.slice(prefix.length);
+  }
+
+  return { providerID, modelID };
 }
 
 export function openCodeQuestionId(
