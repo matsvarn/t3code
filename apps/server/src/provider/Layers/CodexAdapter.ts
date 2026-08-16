@@ -705,34 +705,47 @@ function mapCollabAgentEvent(
       const lastCachedInputTokens = count(last?.cachedInputTokens);
       const lastOutputTokens = count(last?.outputTokens);
       const lastReasoningOutputTokens = count(last?.reasoningOutputTokens);
+      const existing = usageByAgent.get(agentThreadId);
       const baselineCount = (
+        offset: number | undefined,
         cumulative: number | undefined,
         currentTurn: number | undefined,
       ): number | undefined =>
-        cumulative !== undefined && currentTurn !== undefined
+        offset ??
+        (cumulative !== undefined && currentTurn !== undefined
           ? Math.max(cumulative - currentTurn, 0)
-          : undefined;
-      const existing = usageByAgent.get(agentThreadId);
-      const baselineInputTokens = baselineCount(inputTokens, lastInputTokens);
-      const baselineCachedInputTokens = baselineCount(cachedInputTokens, lastCachedInputTokens);
-      const baselineOutputTokens = baselineCount(outputTokens, lastOutputTokens);
+          : undefined);
+      const baselineInputTokens = baselineCount(
+        existing?.baseline.inputTokens,
+        inputTokens,
+        lastInputTokens,
+      );
+      const baselineCachedInputTokens = baselineCount(
+        existing?.baseline.cachedInputTokens,
+        cachedInputTokens,
+        lastCachedInputTokens,
+      );
+      const baselineOutputTokens = baselineCount(
+        existing?.baseline.outputTokens,
+        outputTokens,
+        lastOutputTokens,
+      );
       const baselineReasoningOutputTokens = baselineCount(
+        existing?.baseline.reasoningOutputTokens,
         reasoningOutputTokens,
         lastReasoningOutputTokens,
       );
-      const baseline =
-        existing?.baseline ??
-        ({
-          totalTokens: Math.max(totalTokens - lastTotalTokens, 0),
-          ...(baselineInputTokens !== undefined ? { inputTokens: baselineInputTokens } : {}),
-          ...(baselineCachedInputTokens !== undefined
-            ? { cachedInputTokens: baselineCachedInputTokens }
-            : {}),
-          ...(baselineOutputTokens !== undefined ? { outputTokens: baselineOutputTokens } : {}),
-          ...(baselineReasoningOutputTokens !== undefined
-            ? { reasoningOutputTokens: baselineReasoningOutputTokens }
-            : {}),
-        } satisfies RuntimeTaskUsage);
+      const baseline = {
+        totalTokens: existing?.baseline.totalTokens ?? Math.max(totalTokens - lastTotalTokens, 0),
+        ...(baselineInputTokens !== undefined ? { inputTokens: baselineInputTokens } : {}),
+        ...(baselineCachedInputTokens !== undefined
+          ? { cachedInputTokens: baselineCachedInputTokens }
+          : {}),
+        ...(baselineOutputTokens !== undefined ? { outputTokens: baselineOutputTokens } : {}),
+        ...(baselineReasoningOutputTokens !== undefined
+          ? { reasoningOutputTokens: baselineReasoningOutputTokens }
+          : {}),
+      } satisfies RuntimeTaskUsage;
       const normalizedCount = (
         cumulative: number | undefined,
         offset: number | undefined,

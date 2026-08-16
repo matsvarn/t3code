@@ -1221,19 +1221,18 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
           },
         } satisfies ProviderEvent);
 
+      // Reasoning first appears on the resume frame. Its baseline must initialize then.
       const childAFirstTotal = {
         totalTokens: 5_800_000_100,
         inputTokens: 5_000_000_070,
         cachedInputTokens: 3_000_000_040,
         outputTokens: 800_000_030,
-        reasoningOutputTokens: 5,
       } satisfies RuntimeTaskUsage;
       const childAFirstLast = {
         totalTokens: 100,
         inputTokens: 70,
         cachedInputTokens: 40,
         outputTokens: 30,
-        reasoningOutputTokens: 5,
       } satisfies RuntimeTaskUsage;
       const childBZeroTotal = {
         totalTokens: 5_800_050_000,
@@ -1321,7 +1320,6 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
             inputTokens: 70,
             cachedInputTokens: 40,
             outputTokens: 30,
-            reasoningOutputTokens: 5,
           },
         },
         {
@@ -1351,6 +1349,16 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
             inputTokens: 90,
             cachedInputTokens: 50,
             outputTokens: 40,
+            reasoningOutputTokens: 5,
+          },
+        },
+        {
+          taskId: "child-a",
+          usage: {
+            totalTokens: 150,
+            inputTokens: 100,
+            cachedInputTokens: 55,
+            outputTokens: 50,
             reasoningOutputTokens: 10,
           },
         },
@@ -1361,17 +1369,7 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
             inputTokens: 100,
             cachedInputTokens: 55,
             outputTokens: 50,
-            reasoningOutputTokens: 15,
-          },
-        },
-        {
-          taskId: "child-a",
-          usage: {
-            totalTokens: 150,
-            inputTokens: 100,
-            cachedInputTokens: 55,
-            outputTokens: 50,
-            reasoningOutputTokens: 15,
+            reasoningOutputTokens: 10,
           },
         },
       ]);
