@@ -1530,6 +1530,46 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect(
+    "includes CORS headers on desktop-origin environment descriptor GET with Accept-Encoding",
+    () =>
+      Effect.gen(function* () {
+        yield* buildAppUnderTest();
+
+        const url = yield* getHttpServerUrl("/.well-known/t3/environment");
+        const response = yield* fetchEffect(url, {
+          headers: {
+            origin: "t3code://app",
+            "accept-encoding": "gzip, deflate, br",
+          },
+        });
+        const body = yield* responseJsonEffect<typeof testEnvironmentDescriptor>(response);
+
+        assert.equal(response.status, 200);
+        assertBrowserApiCorsResponseHeaders(response.headers);
+        assert.deepEqual(body, testEnvironmentDescriptor);
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("includes CORS headers on desktop-origin environment descriptor OPTIONS", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+
+      const url = yield* getHttpServerUrl("/.well-known/t3/environment");
+      const response = yield* fetchEffect(url, {
+        method: "OPTIONS",
+        headers: {
+          origin: "t3code://app",
+          "access-control-request-method": "GET",
+          "access-control-request-headers": "content-type",
+        },
+      });
+
+      assert.equal(response.status, 204);
+      assertBrowserApiCorsPreflightHeaders(response.headers);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("reports unauthenticated session state without requiring auth", () =>
     Effect.gen(function* () {
       yield* buildAppUnderTest();
