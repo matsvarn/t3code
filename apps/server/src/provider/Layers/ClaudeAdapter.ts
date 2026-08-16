@@ -617,34 +617,30 @@ function normalizeClaudeTaskProgressTokenUsage(
     return undefined;
   }
 
-  const lastUsedTokens = context.lastKnownTokenUsage?.usedTokens;
-  const activeTokens =
-    lastUsedTokens !== undefined ? Math.max(totalTokens, lastUsedTokens) : totalTokens;
-  if (lastUsedTokens !== undefined && activeTokens === lastUsedTokens) {
+  // Task progress reports cumulative spend (often a subagent's), not active
+  // context. Without a prior active reading, inventing usedTokens from that
+  // total ratchets the meter up and undoes compaction.
+  const lastGood = context.lastKnownTokenUsage;
+  if (!lastGood) {
     return undefined;
   }
 
-  const usage = value as Record<string, unknown>;
-  const snapshot = makeClaudeTokenUsageSnapshot({
-    activeTokens,
-    ...(context.lastKnownContextWindow !== undefined
-      ? { contextWindow: context.lastKnownContextWindow }
-      : {}),
-    totalProcessedTokens: Math.max(
-      totalTokens,
-      context.lastKnownTotalProcessedTokens ?? totalTokens,
-    ),
-  });
-  if (!snapshot) {
+  const previousProcessed =
+    lastGood.totalProcessedTokens ?? context.lastKnownTotalProcessedTokens ?? lastGood.usedTokens;
+  const nextProcessed = Math.max(totalTokens, previousProcessed);
+  if (nextProcessed <= lastGood.usedTokens) {
+    return undefined;
+  }
+  if (
+    lastGood.totalProcessedTokens !== undefined &&
+    nextProcessed <= lastGood.totalProcessedTokens
+  ) {
     return undefined;
   }
 
-  const toolUses = finiteNonNegativeInteger(usage.tool_uses);
-  const durationMs = finiteNonNegativeInteger(usage.duration_ms);
   return {
-    ...snapshot,
-    ...(toolUses !== undefined ? { toolUses } : {}),
-    ...(durationMs !== undefined ? { durationMs } : {}),
+    ...lastGood,
+    totalProcessedTokens: nextProcessed,
   };
 }
 
