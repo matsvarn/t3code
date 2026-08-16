@@ -217,8 +217,7 @@ const desktopRuntimeLayer = desktopClerkLayer.pipe(
 );
 
 if (DesktopPreReadyPlatform.isVersionRequest(process.argv)) {
-  // @effect-diagnostics-next-line globalConsole:off - print and exit before the Effect runtime exists.
-  console.log(Electron.app.getVersion());
+  DesktopPreReadyPlatform.writeStdoutLineSync(Electron.app.getVersion());
   process.exit(0);
 }
 
