@@ -2,7 +2,12 @@ import * as NodeAssert from "node:assert/strict";
 
 import { describe, it } from "vite-plus/test";
 
-import { parseModelsCliOutput, parseAgentListCliOutput } from "./opencodeRuntime.ts";
+import {
+  parseAgentListCliOutput,
+  parseModelsCliOutput,
+  parseOpenCodeModelSlug,
+  toOpenCodeRuntimeModel,
+} from "./opencodeRuntime.ts";
 
 describe("parseModelsCliOutput", () => {
   it("parses a single model from a single provider", () => {
@@ -276,5 +281,38 @@ describe("parseAgentListCliOutput", () => {
     const result = parseAgentListCliOutput(stdout);
     NodeAssert.equal(result[0]!.hidden, true);
     NodeAssert.equal(result[1]!.hidden, false);
+  });
+});
+
+describe("toOpenCodeRuntimeModel", () => {
+  it("splits on the first slash without rewriting a well-formed slug", () => {
+    NodeAssert.deepEqual(toOpenCodeRuntimeModel("opencode-go/deepseek-v4-pro"), {
+      providerID: "opencode-go",
+      modelID: "deepseek-v4-pro",
+    });
+    NodeAssert.deepEqual(toOpenCodeRuntimeModel("openrouter/qwen/qwen3-coder"), {
+      providerID: "openrouter",
+      modelID: "qwen/qwen3-coder",
+    });
+  });
+
+  it("strips a duplicated hosted OpenCode prefix and leaves other catalogs intact", () => {
+    NodeAssert.deepEqual(toOpenCodeRuntimeModel("opencode-go/opencode-go/deepseek-v4-pro"), {
+      providerID: "opencode-go",
+      modelID: "deepseek-v4-pro",
+    });
+    NodeAssert.deepEqual(toOpenCodeRuntimeModel("opencode/opencode/gpt-5.4"), {
+      providerID: "opencode",
+      modelID: "gpt-5.4",
+    });
+    NodeAssert.deepEqual(toOpenCodeRuntimeModel("huggingface/huggingface/CodeBERTa"), {
+      providerID: "huggingface",
+      modelID: "huggingface/CodeBERTa",
+    });
+  });
+
+  it("rejects a bare model id the same way parseOpenCodeModelSlug does", () => {
+    NodeAssert.equal(parseOpenCodeModelSlug("deepseek-v4-pro"), null);
+    NodeAssert.equal(toOpenCodeRuntimeModel("deepseek-v4-pro"), null);
   });
 });

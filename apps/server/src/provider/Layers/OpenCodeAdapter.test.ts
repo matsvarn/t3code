@@ -487,6 +487,72 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("strips a duplicated OpenCode Zen provider prefix before the runtime request", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-zen-doubled");
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "hello",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode/opencode/gpt-5.4",
+        ),
+      });
+
+      NodeAssert.deepEqual(runtimeMock.state.promptCalls.at(-1), {
+        sessionID: "http://127.0.0.1:9999/session",
+        model: {
+          providerID: "opencode",
+          modelID: "gpt-5.4",
+        },
+        parts: [{ type: "text", text: "hello" }],
+      });
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("keeps a catalog key that starts with the same provider id", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-huggingface-slash-key");
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "hello",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "huggingface/huggingface/CodeBERTa",
+        ),
+      });
+
+      NodeAssert.deepEqual(runtimeMock.state.promptCalls.at(-1), {
+        sessionID: "http://127.0.0.1:9999/session",
+        model: {
+          providerID: "huggingface",
+          modelID: "huggingface/CodeBERTa",
+        },
+        parts: [{ type: "text", text: "hello" }],
+      });
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("keeps a slash inside a non-OpenCode-Go model ID", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;

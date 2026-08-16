@@ -254,6 +254,36 @@ it.layer(testLayer)("checkOpenCodeProviderStatus", (it) => {
     }),
   );
 
+  it.effect("keeps a catalog map key that already starts with the provider id", () =>
+    Effect.gen(function* () {
+      runtimeMock.state.inventory = {
+        providerList: {
+          connected: ["huggingface"],
+          all: [
+            {
+              id: "huggingface",
+              name: "Hugging Face",
+              models: {
+                "huggingface/CodeBERTa": {
+                  id: "huggingface/CodeBERTa",
+                  name: "CodeBERTa",
+                },
+              },
+            },
+          ],
+          default: {},
+        },
+        agents: [],
+      };
+
+      const snapshot = yield* checkOpenCodeProviderStatus(makeOpenCodeSettings(), process.cwd());
+      NodeAssert.deepEqual(
+        snapshot.models.map((entry) => entry.slug),
+        ["huggingface/huggingface/CodeBERTa"],
+      );
+    }),
+  );
+
   it.effect("does not spawn a local server for health check (uses CLI instead)", () =>
     Effect.gen(function* () {
       yield* checkOpenCodeProviderStatus(makeOpenCodeSettings(), process.cwd());
