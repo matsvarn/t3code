@@ -587,7 +587,13 @@ describe("ClaudeAdapterLive", () => {
 
   it.effect("treats settings resolution failure as bypass disabled for full access", () => {
     const harness = makeHarness({
-      resolveSettings: () => Effect.fail(new ClaudeSettingsResolveError({})),
+      resolveSettings: () =>
+        Effect.fail(
+          new ClaudeSettingsResolveError({
+            settingSources: ["user", "project", "local"],
+            cause: new Error("settings resolve failed"),
+          }),
+        ),
     });
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
@@ -882,6 +888,142 @@ describe("ClaudeAdapterLive", () => {
       const createInput = harness.getLastCreateQueryInput();
       assert.equal(createInput?.options.permissionMode, "auto");
       assert.equal(process.env.CLAUDE_CONFIG_DIR, previousConfigDir);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("serializes CLAUDE_CONFIG_DIR swaps across Claude adapter instances", () => {
+    let active = 0;
+    let maxActive = 0;
+    const makeResolver =
+      (): NonNullable<ClaudeAdapterLiveOptions["resolveSdkSettings"]> => async () =>
+        Effect.runPromise(
+          Effect.gen(function* () {
+            active += 1;
+            maxActive = Math.max(maxActive, active);
+            yield* Effect.sleep("25 millis");
+            active -= 1;
+            return BYPASS_DISABLED_CLAUDE_SETTINGS;
+          }),
+        );
+    const first = makeHarness({
+      claudeConfig: { homePath: "/tmp/claude-policy-home-a" },
+      resolveSdkSettings: makeResolver(),
+    });
+    const second = makeHarness({
+      instanceId: ProviderInstanceId.make("claudeAgent-work"),
+      claudeConfig: { homePath: "/tmp/claude-policy-home-b" },
+      resolveSdkSettings: makeResolver(),
+    });
+    const start = (harness: ReturnType<typeof makeHarness>, threadId: ThreadId) =>
+      Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        yield* adapter.startSession({
+          threadId,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        });
+      }).pipe(
+        Effect.provideService(Random.Random, makeDeterministicRandomService()),
+        Effect.provide(harness.layer),
+      );
+
+    return Effect.gen(function* () {
+      yield* Effect.all(
+        [start(first, THREAD_ID), start(second, ThreadId.make("thread-claude-2"))],
+        { concurrency: "unbounded" },
+      );
+      assert.equal(maxActive, 1);
+    });
+  });
+
+  it.effect("auto-allows tools when effective Claude mode is still bypass", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      const canUseTool = harness.getLastCreateQueryInput()?.options.canUseTool;
+      assert.equal(typeof canUseTool, "function");
+      if (!canUseTool) {
+        return;
+      }
+
+      const permissionResult = yield* Effect.promise(() =>
+        canUseTool(
+          "Bash",
+          { command: "pwd" },
+          {
+            signal: new AbortController().signal,
+            toolUseID: "tool-use-bypass",
+          },
+        ),
+      );
+      assert.equal(permissionResult.behavior, "allow");
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("does not auto-allow tools when full access is policy-downgraded to supervised", () => {
+    const harness = makeHarness({
+      resolveSettings: () => Effect.succeed(BYPASS_AND_AUTO_DISABLED_CLAUDE_SETTINGS),
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      yield* Stream.take(adapter.streamEvents, 3).pipe(Stream.runDrain);
+
+      const canUseTool = harness.getLastCreateQueryInput()?.options.canUseTool;
+      assert.equal(typeof canUseTool, "function");
+      if (!canUseTool) {
+        return;
+      }
+
+      const permissionPromise = canUseTool(
+        "Bash",
+        { command: "pwd" },
+        {
+          signal: new AbortController().signal,
+          toolUseID: "tool-use-supervised",
+        },
+      );
+
+      const requested = yield* Stream.runHead(adapter.streamEvents);
+      assert.equal(requested._tag, "Some");
+      if (requested._tag !== "Some") {
+        return;
+      }
+      assert.equal(requested.value.type, "request.opened");
+      if (requested.value.type !== "request.opened") {
+        return;
+      }
+      const runtimeRequestId = requested.value.requestId;
+      assert.equal(typeof runtimeRequestId, "string");
+      if (runtimeRequestId === undefined) {
+        return;
+      }
+
+      yield* adapter.respondToRequest(
+        session.threadId,
+        ApprovalRequestId.make(runtimeRequestId),
+        "decline",
+      );
+
+      const permissionResult = yield* Effect.promise(() => permissionPromise);
+      assert.equal(permissionResult.behavior, "deny");
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),

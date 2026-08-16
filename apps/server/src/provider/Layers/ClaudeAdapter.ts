@@ -307,7 +307,9 @@ export interface ClaudeResolvedSettingsSnapshot {
 export class ClaudeSettingsResolveError extends Schema.TaggedErrorClass<ClaudeSettingsResolveError>()(
   "ClaudeSettingsResolveError",
   {
-    cause: Schema.optional(Schema.Defect()),
+    cwd: Schema.optional(Schema.String),
+    settingSources: Schema.Array(Schema.String),
+    cause: Schema.Defect(),
   },
 ) {}
 
@@ -1245,6 +1247,12 @@ const CLAUDE_SETTING_SOURCES = [
   "project",
   "local",
 ] as const satisfies ReadonlyArray<SettingSource>;
+const CLAUDE_RUNTIME_MODE_TO_PERMISSION: Record<string, PermissionMode> = {
+  "auto-accept-edits": "acceptEdits",
+  auto: "auto",
+  "full-access": "bypassPermissions",
+};
+const claudeConfigDirLock = Semaphore.makeUnsafe(1);
 const CLAUDE_BYPASS_DISABLED_SETTINGS = {
   effective: {
     permissions: {
@@ -1790,12 +1798,11 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         prompt: input.prompt,
         options: input.options,
       }) as ClaudeQueryRuntime);
-  const settingsResolveLock = yield* Semaphore.make(1);
   const resolveSdkSettings = options?.resolveSdkSettings ?? resolveClaudeSdkSettings;
   const resolveSettings =
     options?.resolveSettings ??
     ((input) =>
-      settingsResolveLock.withPermits(1)(
+      claudeConfigDirLock.withPermits(1)(
         withProcessClaudeConfigDir(
           claudeEnvironment.CLAUDE_CONFIG_DIR,
           Effect.tryPromise({
@@ -1804,7 +1811,12 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
                 ...(input.cwd ? { cwd: input.cwd } : {}),
                 settingSources: [...input.settingSources],
               }),
-            catch: (cause) => new ClaudeSettingsResolveError({ cause }),
+            catch: (cause) =>
+              new ClaudeSettingsResolveError({
+                ...(input.cwd ? { cwd: input.cwd } : {}),
+                settingSources: [...input.settingSources],
+                cause,
+              }),
           }),
         ),
       ));
@@ -3929,6 +3941,33 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
       const contextRef = yield* Ref.make<ClaudeSessionContext | undefined>(undefined);
 
+      const requestedPermissionMode = CLAUDE_RUNTIME_MODE_TO_PERMISSION[input.runtimeMode];
+      const permissionMode =
+        requestedPermissionMode === "bypassPermissions" || requestedPermissionMode === "auto"
+          ? effectiveClaudePermissionMode(
+              requestedPermissionMode,
+              yield* resolveSettings({
+                ...(input.cwd ? { cwd: input.cwd } : {}),
+                settingSources: CLAUDE_SETTING_SOURCES,
+              }).pipe(
+                Effect.tapError(() =>
+                  Effect.logWarning("claude.settings.resolve-failed", {
+                    threadId,
+                  }),
+                ),
+                Effect.orElseSucceed(() => CLAUDE_BYPASS_DISABLED_SETTINGS),
+              ),
+            )
+          : requestedPermissionMode;
+      if (permissionMode !== requestedPermissionMode) {
+        yield* Effect.logWarning("claude.permission.mode-downgraded", {
+          threadId,
+          requestedRuntimeMode: input.runtimeMode,
+          requestedPermissionMode,
+          effectivePermissionMode: permissionMode ?? "default",
+        });
+      }
+
       /**
        * Handle AskUserQuestion tool calls by emitting a `user-input.requested`
        * runtime event and waiting for the user to respond via `respondToUserInput`.
@@ -4109,8 +4148,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           } satisfies PermissionResult;
         }
 
-        const runtimeMode = input.runtimeMode ?? "full-access";
-        if (runtimeMode === "full-access") {
+        if (permissionMode === "bypassPermissions") {
           return {
             behavior: "allow",
             updatedInput: toolInput,
@@ -4252,37 +4290,6 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         : undefined;
       const ultracode = isClaudeUltracodeEffort(effort);
       const effectiveEffort = getEffectiveClaudeAgentEffort(effort, modelSelection?.model);
-      const runtimeModeToPermission: Record<string, PermissionMode> = {
-        "auto-accept-edits": "acceptEdits",
-        auto: "auto",
-        "full-access": "bypassPermissions",
-      };
-      const requestedPermissionMode = runtimeModeToPermission[input.runtimeMode];
-      const permissionMode =
-        requestedPermissionMode === "bypassPermissions" || requestedPermissionMode === "auto"
-          ? effectiveClaudePermissionMode(
-              requestedPermissionMode,
-              yield* resolveSettings({
-                ...(input.cwd ? { cwd: input.cwd } : {}),
-                settingSources: CLAUDE_SETTING_SOURCES,
-              }).pipe(
-                Effect.tapError(() =>
-                  Effect.logWarning("claude.settings.resolve-failed", {
-                    threadId,
-                  }),
-                ),
-                Effect.orElseSucceed(() => CLAUDE_BYPASS_DISABLED_SETTINGS),
-              ),
-            )
-          : requestedPermissionMode;
-      if (permissionMode !== requestedPermissionMode) {
-        yield* Effect.logWarning("claude.permission.mode-downgraded", {
-          threadId,
-          requestedRuntimeMode: input.runtimeMode,
-          requestedPermissionMode,
-          effectivePermissionMode: permissionMode ?? "default",
-        });
-      }
       const settings = {
         ...(typeof thinking === "boolean" ? { alwaysThinkingEnabled: thinking } : {}),
         ...(fastMode ? { fastMode: true } : {}),
