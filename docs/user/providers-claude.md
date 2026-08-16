@@ -215,3 +215,9 @@ If the preset needs different Claude files, give it a different `CLAUDE_CONFIG_D
 different API keys, base URLs, or router settings, use Environment variables.
 
 Do not put environment variable assignments in `Launch arguments`.
+
+## Full Access When Bypass Permissions Are Locked
+
+Some Claude setups, including organization policy, forbid bypass-permissions mode. If you pick
+**Full access** there, T3 Code keeps the thread on Full access but starts Claude in **Auto** so the
+session can run. Pick Auto yourself if you want the composer to match what Claude will enforce.

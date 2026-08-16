@@ -13,6 +13,7 @@ import {
   type PermissionMode,
   type PermissionResult,
   type PermissionUpdate,
+  resolveSettings as resolveClaudeSdkSettings,
   type SDKMessage,
   type SDKControlGetContextUsageResponse,
   type SDKResultMessage,
@@ -70,6 +71,7 @@ import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
@@ -292,6 +294,21 @@ interface ClaudeQueryRuntime extends AsyncIterable<SDKMessage> {
   readonly close: () => void;
 }
 
+export interface ClaudeResolvedSettingsSnapshot {
+  readonly effective?: {
+    readonly permissions?: {
+      readonly disableBypassPermissionsMode?: unknown;
+    };
+  };
+}
+
+export class ClaudeSettingsResolveError extends Schema.TaggedErrorClass<ClaudeSettingsResolveError>()(
+  "ClaudeSettingsResolveError",
+  {
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {}
+
 export interface ClaudeAdapterLiveOptions {
   readonly instanceId?: ProviderInstanceId;
   readonly environment?: NodeJS.ProcessEnv;
@@ -301,6 +318,16 @@ export interface ClaudeAdapterLiveOptions {
   }) => ClaudeQueryRuntime;
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
+  /**
+   * Optional settings snapshot used to honor Claude's
+   * `permissions.disableBypassPermissionsMode` policy before requesting
+   * `bypassPermissions`. Production uses the SDK's `resolveSettings()` with
+   * the same filesystem sources as the session. Tests inject fixtures.
+   */
+  readonly resolveSettings?: (input: {
+    readonly cwd?: string;
+    readonly settingSources: ReadonlyArray<SettingSource>;
+  }) => Effect.Effect<ClaudeResolvedSettingsSnapshot, ClaudeSettingsResolveError>;
 }
 
 function isUuid(value: string): boolean {
@@ -1206,6 +1233,44 @@ const CLAUDE_SETTING_SOURCES = [
   "project",
   "local",
 ] as const satisfies ReadonlyArray<SettingSource>;
+const CLAUDE_BYPASS_DISABLED_FALLBACK_MODE = "auto" satisfies PermissionMode;
+const CLAUDE_BYPASS_DISABLED_SETTINGS = {
+  effective: {
+    permissions: {
+      disableBypassPermissionsMode: "disable",
+    },
+  },
+} as const satisfies ClaudeResolvedSettingsSnapshot;
+
+function isClaudeBypassPermissionsDisabled(settings: ClaudeResolvedSettingsSnapshot): boolean {
+  return settings.effective?.permissions?.disableBypassPermissionsMode === "disable";
+}
+
+function withProcessClaudeConfigDir<A, E, R>(
+  configDir: string | undefined,
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> {
+  if (configDir === undefined) {
+    return effect;
+  }
+
+  return Effect.acquireUseRelease(
+    Effect.sync(() => {
+      const previous = process.env.CLAUDE_CONFIG_DIR;
+      process.env.CLAUDE_CONFIG_DIR = configDir;
+      return previous;
+    }),
+    () => effect,
+    (previous) =>
+      Effect.sync(() => {
+        if (previous === undefined) {
+          delete process.env.CLAUDE_CONFIG_DIR;
+        } else {
+          process.env.CLAUDE_CONFIG_DIR = previous;
+        }
+      }),
+  );
+}
 
 function buildPromptText(
   input: ProviderSendTurnInput,
@@ -1687,6 +1752,23 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         prompt: input.prompt,
         options: input.options,
       }) as ClaudeQueryRuntime);
+  const settingsResolveLock = yield* Semaphore.make(1);
+  const resolveSettings =
+    options?.resolveSettings ??
+    ((input) =>
+      settingsResolveLock.withPermits(1)(
+        withProcessClaudeConfigDir(
+          claudeEnvironment.CLAUDE_CONFIG_DIR,
+          Effect.tryPromise({
+            try: () =>
+              resolveClaudeSdkSettings({
+                ...(input.cwd ? { cwd: input.cwd } : {}),
+                settingSources: [...input.settingSources],
+              }),
+            catch: (cause) => new ClaudeSettingsResolveError({ cause }),
+          }),
+        ),
+      ));
 
   const sessions = new Map<ThreadId, ClaudeSessionContext>();
   const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
@@ -4136,7 +4218,30 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         auto: "auto",
         "full-access": "bypassPermissions",
       };
-      const permissionMode = runtimeModeToPermission[input.runtimeMode];
+      const requestedPermissionMode = runtimeModeToPermission[input.runtimeMode];
+      let permissionMode = requestedPermissionMode;
+      if (permissionMode === "bypassPermissions") {
+        const resolvedSettings = yield* resolveSettings({
+          ...(input.cwd ? { cwd: input.cwd } : {}),
+          settingSources: CLAUDE_SETTING_SOURCES,
+        }).pipe(
+          Effect.tapError(() =>
+            Effect.logWarning("claude.settings.resolve-failed", {
+              threadId,
+            }),
+          ),
+          Effect.orElseSucceed(() => CLAUDE_BYPASS_DISABLED_SETTINGS),
+        );
+        if (isClaudeBypassPermissionsDisabled(resolvedSettings)) {
+          permissionMode = CLAUDE_BYPASS_DISABLED_FALLBACK_MODE;
+          yield* Effect.logWarning("claude.permission.bypass-disabled", {
+            threadId,
+            requestedRuntimeMode: input.runtimeMode,
+            requestedPermissionMode,
+            effectivePermissionMode: permissionMode,
+          });
+        }
+      }
       const settings = {
         ...(typeof thinking === "boolean" ? { alwaysThinkingEnabled: thinking } : {}),
         ...(fastMode ? { fastMode: true } : {}),
@@ -4195,6 +4300,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         "provider.kind": PROVIDER,
         "provider.thread_id": threadId,
         "provider.runtime_mode": input.runtimeMode,
+        "claude.query.requested_permission_mode": requestedPermissionMode ?? "",
         "claude.resume.source":
           existingResumeSessionId !== undefined ? "resume-session" : "generated-session",
         "claude.resume.thread_id": resumeState?.threadId ?? "",
