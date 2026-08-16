@@ -220,4 +220,6 @@ Do not put environment variable assignments in `Launch arguments`.
 
 Some Claude setups, including organization policy, forbid bypass-permissions mode. If you pick
 **Full access** there, T3 Code keeps the thread on Full access but starts Claude in **Auto** so the
-session can run. Pick Auto yourself if you want the composer to match what Claude will enforce.
+session can run. If Auto is also locked — or you pick Auto while Auto is locked — the session starts
+in **Supervised** instead. Pick the composer mode that matches what Claude will enforce if you want
+the label to stay in sync.

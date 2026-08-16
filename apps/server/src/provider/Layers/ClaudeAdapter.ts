@@ -296,7 +296,9 @@ interface ClaudeQueryRuntime extends AsyncIterable<SDKMessage> {
 
 export interface ClaudeResolvedSettingsSnapshot {
   readonly effective?: {
+    readonly disableAutoMode?: unknown;
     readonly permissions?: {
+      readonly disableAutoMode?: unknown;
       readonly disableBypassPermissionsMode?: unknown;
     };
   };
@@ -320,14 +322,24 @@ export interface ClaudeAdapterLiveOptions {
   readonly nativeEventLogger?: EventNdjsonLogger;
   /**
    * Optional settings snapshot used to honor Claude's
-   * `permissions.disableBypassPermissionsMode` policy before requesting
-   * `bypassPermissions`. Production uses the SDK's `resolveSettings()` with
-   * the same filesystem sources as the session. Tests inject fixtures.
+   * `permissions.disableBypassPermissionsMode` and `disableAutoMode` policy
+   * before requesting those modes. Production uses the SDK's
+   * `resolveSettings()` with the same filesystem sources as the session.
+   * Tests inject fixtures.
    */
   readonly resolveSettings?: (input: {
     readonly cwd?: string;
     readonly settingSources: ReadonlyArray<SettingSource>;
   }) => Effect.Effect<ClaudeResolvedSettingsSnapshot, ClaudeSettingsResolveError>;
+  /**
+   * Optional inner `resolveSettings()` used when `resolveSettings` is omitted.
+   * Production calls the SDK. Tests inject this to observe `CLAUDE_CONFIG_DIR`
+   * without hitting disk or managed policy.
+   */
+  readonly resolveSdkSettings?: (input: {
+    readonly cwd?: string;
+    readonly settingSources: ReadonlyArray<SettingSource>;
+  }) => Promise<ClaudeResolvedSettingsSnapshot>;
 }
 
 function isUuid(value: string): boolean {
@@ -1233,7 +1245,6 @@ const CLAUDE_SETTING_SOURCES = [
   "project",
   "local",
 ] as const satisfies ReadonlyArray<SettingSource>;
-const CLAUDE_BYPASS_DISABLED_FALLBACK_MODE = "auto" satisfies PermissionMode;
 const CLAUDE_BYPASS_DISABLED_SETTINGS = {
   effective: {
     permissions: {
@@ -1242,8 +1253,33 @@ const CLAUDE_BYPASS_DISABLED_SETTINGS = {
   },
 } as const satisfies ClaudeResolvedSettingsSnapshot;
 
+function isClaudePolicyDisabled(value: unknown): boolean {
+  return value === "disable";
+}
+
 function isClaudeBypassPermissionsDisabled(settings: ClaudeResolvedSettingsSnapshot): boolean {
-  return settings.effective?.permissions?.disableBypassPermissionsMode === "disable";
+  return isClaudePolicyDisabled(settings.effective?.permissions?.disableBypassPermissionsMode);
+}
+
+function isClaudeAutoModeDisabled(settings: ClaudeResolvedSettingsSnapshot): boolean {
+  return (
+    isClaudePolicyDisabled(settings.effective?.disableAutoMode) ||
+    isClaudePolicyDisabled(settings.effective?.permissions?.disableAutoMode)
+  );
+}
+
+function effectiveClaudePermissionMode(
+  requested: PermissionMode | undefined,
+  settings: ClaudeResolvedSettingsSnapshot,
+): PermissionMode | undefined {
+  const autoDisabled = isClaudeAutoModeDisabled(settings);
+  if (requested === "bypassPermissions" && isClaudeBypassPermissionsDisabled(settings)) {
+    return autoDisabled ? undefined : "auto";
+  }
+  if (requested === "auto" && autoDisabled) {
+    return undefined;
+  }
+  return requested;
 }
 
 function withProcessClaudeConfigDir<A, E, R>(
@@ -1254,6 +1290,8 @@ function withProcessClaudeConfigDir<A, E, R>(
     return effect;
   }
 
+  // acquire/release are uninterruptible; keep `use` interruptible so a hung
+  // SDK resolve cannot pin CLAUDE_CONFIG_DIR or block later session starts.
   return Effect.acquireUseRelease(
     Effect.sync(() => {
       const previous = process.env.CLAUDE_CONFIG_DIR;
@@ -1753,6 +1791,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         options: input.options,
       }) as ClaudeQueryRuntime);
   const settingsResolveLock = yield* Semaphore.make(1);
+  const resolveSdkSettings = options?.resolveSdkSettings ?? resolveClaudeSdkSettings;
   const resolveSettings =
     options?.resolveSettings ??
     ((input) =>
@@ -1761,7 +1800,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           claudeEnvironment.CLAUDE_CONFIG_DIR,
           Effect.tryPromise({
             try: () =>
-              resolveClaudeSdkSettings({
+              resolveSdkSettings({
                 ...(input.cwd ? { cwd: input.cwd } : {}),
                 settingSources: [...input.settingSources],
               }),
@@ -4219,28 +4258,30 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         "full-access": "bypassPermissions",
       };
       const requestedPermissionMode = runtimeModeToPermission[input.runtimeMode];
-      let permissionMode = requestedPermissionMode;
-      if (permissionMode === "bypassPermissions") {
-        const resolvedSettings = yield* resolveSettings({
-          ...(input.cwd ? { cwd: input.cwd } : {}),
-          settingSources: CLAUDE_SETTING_SOURCES,
-        }).pipe(
-          Effect.tapError(() =>
-            Effect.logWarning("claude.settings.resolve-failed", {
-              threadId,
-            }),
-          ),
-          Effect.orElseSucceed(() => CLAUDE_BYPASS_DISABLED_SETTINGS),
-        );
-        if (isClaudeBypassPermissionsDisabled(resolvedSettings)) {
-          permissionMode = CLAUDE_BYPASS_DISABLED_FALLBACK_MODE;
-          yield* Effect.logWarning("claude.permission.bypass-disabled", {
-            threadId,
-            requestedRuntimeMode: input.runtimeMode,
-            requestedPermissionMode,
-            effectivePermissionMode: permissionMode,
-          });
-        }
+      const permissionMode =
+        requestedPermissionMode === "bypassPermissions" || requestedPermissionMode === "auto"
+          ? effectiveClaudePermissionMode(
+              requestedPermissionMode,
+              yield* resolveSettings({
+                ...(input.cwd ? { cwd: input.cwd } : {}),
+                settingSources: CLAUDE_SETTING_SOURCES,
+              }).pipe(
+                Effect.tapError(() =>
+                  Effect.logWarning("claude.settings.resolve-failed", {
+                    threadId,
+                  }),
+                ),
+                Effect.orElseSucceed(() => CLAUDE_BYPASS_DISABLED_SETTINGS),
+              ),
+            )
+          : requestedPermissionMode;
+      if (permissionMode !== requestedPermissionMode) {
+        yield* Effect.logWarning("claude.permission.mode-downgraded", {
+          threadId,
+          requestedRuntimeMode: input.runtimeMode,
+          requestedPermissionMode,
+          effectivePermissionMode: permissionMode ?? "default",
+        });
       }
       const settings = {
         ...(typeof thinking === "boolean" ? { alwaysThinkingEnabled: thinking } : {}),

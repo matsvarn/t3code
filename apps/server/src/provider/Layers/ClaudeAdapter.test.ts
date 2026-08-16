@@ -166,6 +166,23 @@ const BYPASS_DISABLED_CLAUDE_SETTINGS = {
     },
   },
 } as const;
+const AUTO_DISABLED_CLAUDE_SETTINGS = {
+  effective: {
+    disableAutoMode: "disable",
+    permissions: {
+      disableAutoMode: "disable",
+    },
+  },
+} as const;
+const BYPASS_AND_AUTO_DISABLED_CLAUDE_SETTINGS = {
+  effective: {
+    disableAutoMode: "disable",
+    permissions: {
+      disableBypassPermissionsMode: "disable",
+      disableAutoMode: "disable",
+    },
+  },
+} as const;
 
 function makeHarness(config?: {
   readonly nativeEventLogPath?: string;
@@ -175,6 +192,7 @@ function makeHarness(config?: {
   readonly claudeConfig?: Partial<ClaudeSettings>;
   readonly instanceId?: ProviderInstanceId;
   readonly resolveSettings?: ClaudeAdapterLiveOptions["resolveSettings"];
+  readonly resolveSdkSettings?: ClaudeAdapterLiveOptions["resolveSdkSettings"];
 }) {
   const query = new FakeClaudeQuery();
   let createInput:
@@ -190,7 +208,12 @@ function makeHarness(config?: {
       createInput = input;
       return query;
     },
-    resolveSettings: config?.resolveSettings ?? (() => Effect.succeed(PERMISSIVE_CLAUDE_SETTINGS)),
+    ...(config?.resolveSdkSettings
+      ? { resolveSdkSettings: config.resolveSdkSettings }
+      : {
+          resolveSettings:
+            config?.resolveSettings ?? (() => Effect.succeed(PERMISSIVE_CLAUDE_SETTINGS)),
+        }),
     ...(config?.nativeEventLogger
       ? {
           nativeEventLogger: config.nativeEventLogger,
@@ -540,6 +563,28 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("starts supervised when policy disables both bypass and auto for full access", () => {
+    const harness = makeHarness({
+      resolveSettings: () => Effect.succeed(BYPASS_AND_AUTO_DISABLED_CLAUDE_SETTINGS),
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      const createInput = harness.getLastCreateQueryInput();
+      assert.equal(session.runtimeMode, "full-access");
+      assert.equal(createInput?.options.permissionMode, undefined);
+      assert.equal(createInput?.options.allowDangerouslySkipPermissions, undefined);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("treats settings resolution failure as bypass disabled for full access", () => {
     const harness = makeHarness({
       resolveSettings: () => Effect.fail(new ClaudeSettingsResolveError({})),
@@ -633,6 +678,210 @@ describe("ClaudeAdapterLive", () => {
       });
 
       assert.deepEqual(harness.query.setPermissionModeCalls, ["plan", "auto"]);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("starts supervised when policy disables auto for auto runtime", () => {
+    const harness = makeHarness({
+      resolveSettings: () => Effect.succeed(AUTO_DISABLED_CLAUDE_SETTINGS),
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "auto",
+      });
+
+      const createInput = harness.getLastCreateQueryInput();
+      assert.equal(session.runtimeMode, "auto");
+      assert.equal(createInput?.options.permissionMode, undefined);
+      assert.equal(createInput?.options.allowDangerouslySkipPermissions, undefined);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("honors permissions.disableAutoMode without the top-level copy", () => {
+    const harness = makeHarness({
+      resolveSettings: () =>
+        Effect.succeed({
+          effective: {
+            permissions: {
+              disableAutoMode: "disable",
+            },
+          },
+        }),
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "auto",
+      });
+
+      const createInput = harness.getLastCreateQueryInput();
+      assert.equal(createInput?.options.permissionMode, undefined);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("honors top-level disableAutoMode without the permissions copy", () => {
+    const harness = makeHarness({
+      resolveSettings: () =>
+        Effect.succeed({
+          effective: {
+            disableAutoMode: "disable",
+          },
+        }),
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "auto",
+      });
+
+      const createInput = harness.getLastCreateQueryInput();
+      assert.equal(createInput?.options.permissionMode, undefined);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("keeps bypass when auto is locked but bypass is allowed", () => {
+    const harness = makeHarness({
+      resolveSettings: () => Effect.succeed(AUTO_DISABLED_CLAUDE_SETTINGS),
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      const createInput = harness.getLastCreateQueryInput();
+      assert.equal(createInput?.options.permissionMode, "bypassPermissions");
+      assert.equal(createInput?.options.allowDangerouslySkipPermissions, true);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect(
+    "restores default after plan when full access was policy-downgraded to supervised",
+    () => {
+      const harness = makeHarness({
+        resolveSettings: () => Effect.succeed(BYPASS_AND_AUTO_DISABLED_CLAUDE_SETTINGS),
+      });
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        const session = yield* adapter.startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        });
+
+        yield* adapter.sendTurn({
+          threadId: session.threadId,
+          input: "plan this",
+          interactionMode: "plan",
+          attachments: [],
+        });
+
+        const turnCompletedFiber = yield* Stream.filter(
+          adapter.streamEvents,
+          (event) => event.type === "turn.completed",
+        ).pipe(Stream.runHead, Effect.forkChild);
+
+        harness.query.emit({
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          errors: [],
+          session_id: "sdk-session-policy-default",
+          uuid: "result-policy-default",
+        } as unknown as SDKMessage);
+
+        yield* Fiber.join(turnCompletedFiber);
+
+        yield* adapter.sendTurn({
+          threadId: session.threadId,
+          input: "now do it",
+          interactionMode: "default",
+          attachments: [],
+        });
+
+        assert.deepEqual(harness.query.setPermissionModeCalls, ["plan", "default"]);
+      }).pipe(
+        Effect.provideService(Random.Random, makeDeterministicRandomService()),
+        Effect.provide(harness.layer),
+      );
+    },
+  );
+
+  it.effect("resolves Claude settings with the instance CLAUDE_CONFIG_DIR", () => {
+    const homePath = "/tmp/claude-policy-home-test";
+    const seenConfigDirs: Array<string | undefined> = [];
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    const harness = makeHarness({
+      claudeConfig: { homePath },
+      resolveSdkSettings: async () => {
+        seenConfigDirs.push(process.env.CLAUDE_CONFIG_DIR);
+        return BYPASS_DISABLED_CLAUDE_SETTINGS;
+      },
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      const createInput = harness.getLastCreateQueryInput();
+      assert.equal(session.runtimeMode, "full-access");
+      assert.equal(createInput?.options.permissionMode, "auto");
+      assert.equal(createInput?.options.allowDangerouslySkipPermissions, undefined);
+      assert.deepEqual(seenConfigDirs, [homePath]);
+      assert.equal(process.env.CLAUDE_CONFIG_DIR, previousConfigDir);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("restores CLAUDE_CONFIG_DIR when settings resolution throws", () => {
+    const homePath = "/tmp/claude-policy-home-throw";
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    const harness = makeHarness({
+      claudeConfig: { homePath },
+      resolveSdkSettings: async () => {
+        throw new Error("sdk resolve boom");
+      },
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      const createInput = harness.getLastCreateQueryInput();
+      assert.equal(createInput?.options.permissionMode, "auto");
+      assert.equal(process.env.CLAUDE_CONFIG_DIR, previousConfigDir);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
