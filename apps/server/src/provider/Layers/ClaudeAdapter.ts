@@ -2115,6 +2115,22 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     return normalizeClaudeContextUsageApiSnapshot(usage, totalProcessedTokens);
   });
 
+  const resolveCompactBoundaryTokenUsage = Effect.fn("resolveCompactBoundaryTokenUsage")(function* (
+    context: ClaudeSessionContext,
+    message: Record<string, unknown>,
+  ) {
+    const metadataSnapshot = compactBoundaryTokenUsageSnapshot(
+      message,
+      context.lastKnownContextWindow,
+      context.lastKnownTotalProcessedTokens,
+    );
+    if (metadataSnapshot) {
+      return metadataSnapshot;
+    }
+
+    return yield* queryCurrentContextUsage(context, context.lastKnownTotalProcessedTokens);
+  });
+
   const emitProposedPlanCompleted = Effect.fn("emitProposedPlanCompleted")(function* (
     context: ClaudeSessionContext,
     input: {
@@ -3122,19 +3138,15 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           },
         });
         return;
-      case "compact_boundary":
-        yield* emitThreadTokenUsage(
+      case "compact_boundary": {
+        const snapshot = yield* resolveCompactBoundaryTokenUsage(
           context,
-          compactBoundaryTokenUsageSnapshot(
-            message as unknown as Record<string, unknown>,
-            context.lastKnownContextWindow,
-            context.lastKnownTotalProcessedTokens,
-          ),
-          {
-            rawMethod: "claude/system/compact_boundary",
-            rawPayload: message,
-          },
+          message as unknown as Record<string, unknown>,
         );
+        yield* emitThreadTokenUsage(context, snapshot, {
+          rawMethod: "claude/system/compact_boundary",
+          rawPayload: message,
+        });
         yield* offerRuntimeEvent({
           ...base,
           type: "thread.state.changed",
@@ -3144,6 +3156,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           },
         });
         return;
+      }
       case "hook_started":
         yield* offerRuntimeEvent({
           ...base,
