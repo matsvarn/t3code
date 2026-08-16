@@ -29,6 +29,10 @@ export function readCommandLineSwitchValue(
   return value.length > 0 ? value : null;
 }
 
+export function isVersionRequest(argv: ReadonlyArray<string>): boolean {
+  return argv.includes("--version") || argv.includes("-V");
+}
+
 export const resolveEarlyLinuxElectronOptionsFromProcess =
   (): DesktopEarlyElectronStartup.EarlyLinuxElectronOptions =>
     DesktopEarlyElectronStartup.resolveEarlyLinuxElectronOptions({

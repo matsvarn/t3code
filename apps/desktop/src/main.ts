@@ -216,4 +216,10 @@ const desktopRuntimeLayer = desktopClerkLayer.pipe(
   Layer.provideMerge(DesktopPreReadyPlatform.layer),
 );
 
+if (DesktopPreReadyPlatform.isVersionRequest(process.argv)) {
+  // @effect-diagnostics-next-line globalConsole:off - print and exit before the Effect runtime exists.
+  console.log(Electron.app.getVersion());
+  process.exit(0);
+}
+
 DesktopApp.program.pipe(Effect.provide(desktopRuntimeLayer), NodeRuntime.runMain);

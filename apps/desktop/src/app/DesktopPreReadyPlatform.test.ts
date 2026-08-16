@@ -78,6 +78,16 @@ describe("DesktopPreReadyPlatform", () => {
     assert.isNull(value);
   });
 
+  it("detects --version and -V as whole-token version requests", () => {
+    assert.isTrue(DesktopPreReadyPlatform.isVersionRequest(["--version"]));
+    assert.isTrue(DesktopPreReadyPlatform.isVersionRequest(["-V"]));
+    assert.isFalse(DesktopPreReadyPlatform.isVersionRequest(["--no-sandbox"]));
+    assert.isFalse(DesktopPreReadyPlatform.isVersionRequest(["--version=1"]));
+    assert.isFalse(DesktopPreReadyPlatform.isVersionRequest(["--version-foo"]));
+    assert.isFalse(DesktopPreReadyPlatform.isVersionRequest(["-v"]));
+    assert.isFalse(DesktopPreReadyPlatform.isVersionRequest([]));
+  });
+
   it.effect(
     "acquires a synchronous pre-ready layer before an asynchronous Clerk-shaped layer",
     () =>
