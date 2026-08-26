@@ -637,6 +637,10 @@ function compactBoundaryTokenUsageSnapshot(
   if (postTokens === undefined || postTokens <= 0) {
     return undefined;
   }
+  const knownContextWindow = finitePositiveInteger(contextWindow);
+  if (knownContextWindow !== undefined && postTokens > knownContextWindow) {
+    return undefined;
+  }
 
   const preTokens = finiteNonNegativeInteger(compactMetadata.pre_tokens);
   return makeClaudeTokenUsageSnapshot({
@@ -2261,7 +2265,14 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     }
 
     const maxTokens = resultContextWindow ?? context.lastKnownContextWindow;
-    const accumulatedTotalProcessedTokens = claudeTotalProcessedTokens(result?.usage);
+    const reportedTotalProcessedTokens = claudeTotalProcessedTokens(result?.usage);
+    const accumulatedTotalProcessedTokens =
+      reportedTotalProcessedTokens !== undefined
+        ? Math.max(
+            reportedTotalProcessedTokens,
+            context.lastKnownTotalProcessedTokens ?? reportedTotalProcessedTokens,
+          )
+        : undefined;
     if (accumulatedTotalProcessedTokens !== undefined) {
       context.lastKnownTotalProcessedTokens = accumulatedTotalProcessedTokens;
     }
@@ -4545,6 +4556,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         });
         context.currentApiModelId = apiModelId;
       }
+      context.lastKnownContextWindow = selectedClaudeContextWindow(modelSelection);
       context.session = {
         ...context.session,
         model: modelSelection.model,
