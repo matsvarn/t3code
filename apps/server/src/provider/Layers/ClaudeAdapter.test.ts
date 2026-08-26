@@ -167,6 +167,27 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
   }
 }
 
+function makeControlledPromise<A>() {
+  let resolve!: (value: A | PromiseLike<A>) => void;
+  let reject!: (cause?: unknown) => void;
+  const promise = new Promise<A>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function promptMessageText(message: SDKUserMessage | undefined): string | undefined {
+  if (!message) {
+    return undefined;
+  }
+  if (typeof message.message.content === "string") {
+    return message.message.content;
+  }
+  const content = message.message.content[0];
+  return content?.type === "text" ? content.text : undefined;
+}
+
 function makeHarness(config?: {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: ClaudeAdapterLiveOptions["nativeEventLogger"];
@@ -301,20 +322,158 @@ function compactBoundaryMessage(compactMetadata?: unknown): SDKMessage {
   } as unknown as SDKMessage;
 }
 
-function highTaskProgressMessage(): SDKMessage {
+function highTaskProgressMessage(totalTokens = 900_000): SDKMessage {
   return {
     type: "system",
     subtype: "task_progress",
     task_id: "task-pre-compact",
     description: "Orchestrating before compact",
     usage: {
-      total_tokens: 900_000,
+      total_tokens: totalTokens,
       tool_uses: 12,
       duration_ms: 45_000,
     },
     session_id: "sdk-session-compact",
     uuid: "task-pre-compact-progress",
   } as unknown as SDKMessage;
+}
+
+function emitResumeHandshake(query: FakeClaudeQuery, suffix: string): void {
+  query.emit({
+    type: "system",
+    subtype: "init",
+    apiKeySource: "none",
+    claude_code_version: "test",
+    cwd: "/tmp/claude-adapter-test",
+    tools: [],
+    mcp_servers: [],
+    model: "claude-sonnet-4-5",
+    permissionMode: "bypassPermissions",
+    slash_commands: [],
+    output_style: "default",
+    skills: [],
+    plugins: [],
+    session_id: "550e8400-e29b-41d4-a716-446655440000",
+    uuid: `resume-init-${suffix}`,
+  } as unknown as SDKMessage);
+  query.emit({
+    type: "result",
+    subtype: "success",
+    is_error: false,
+    errors: [],
+    num_turns: 0,
+    usage: { input_tokens: 0, output_tokens: 0 },
+    session_id: "550e8400-e29b-41d4-a716-446655440000",
+    uuid: `resume-result-${suffix}`,
+  } as unknown as SDKMessage);
+}
+
+function highPriorityNotification(text: string, suffix: string): SDKMessage {
+  return {
+    type: "system",
+    subtype: "notification",
+    key: `notification-${suffix}`,
+    text,
+    priority: "high",
+    session_id: "550e8400-e29b-41d4-a716-446655440000",
+    uuid: `notification-${suffix}`,
+  } as unknown as SDKMessage;
+}
+
+function resumeUsageAfterModelChange(outcome: "success" | "failure") {
+  const harness = makeHarness();
+  const modelChangeStarted = makeControlledPromise<void>();
+  const modelChange = makeControlledPromise<void>();
+  const expectedMaxTokens = outcome === "success" ? 200_000 : 1_000_000;
+  harness.query.stubContextUsage({
+    totalTokens: 18_000,
+    maxTokens: expectedMaxTokens,
+    isAutoCompactEnabled: true,
+  } as SDKControlGetContextUsageResponse);
+  Object.assign(harness.query, {
+    setModel: async (model?: string) => {
+      harness.query.setModelCalls.push(model);
+      modelChangeStarted.resolve();
+      await modelChange.promise;
+    },
+  });
+  const initialSelection = createModelSelection(
+    ProviderInstanceId.make("claudeAgent"),
+    "claude-opus-4-6",
+    [{ id: "contextWindow", value: "1m" }],
+  );
+  const nextSelection = createModelSelection(
+    ProviderInstanceId.make("claudeAgent"),
+    "claude-opus-4-6",
+    [{ id: "contextWindow", value: "200k" }],
+  );
+
+  return Effect.gen(function* () {
+    const adapter = yield* ClaudeAdapter;
+    const drained = `resume during ${outcome} model change drained`;
+    const drainedFiber = yield* Stream.takeUntil(
+      adapter.streamEvents,
+      (event) => event.type === "runtime.warning" && event.payload.message === drained,
+    ).pipe(Stream.runCollect, Effect.forkChild);
+    yield* adapter.startSession({
+      threadId: RESUME_THREAD_ID,
+      provider: ProviderDriverKind.make("claudeAgent"),
+      modelSelection: initialSelection,
+      resumeCursor: {
+        threadId: RESUME_THREAD_ID,
+        resume: "550e8400-e29b-41d4-a716-446655440000",
+        turnCount: 3,
+      },
+      runtimeMode: "full-access",
+    });
+    const sendFiber = yield* adapter
+      .sendTurn({
+        threadId: RESUME_THREAD_ID,
+        input: `${outcome} model before resume usage`,
+        attachments: [],
+        modelSelection: nextSelection,
+      })
+      .pipe(Effect.result, Effect.forkChild);
+    yield* Effect.promise(() => modelChangeStarted.promise);
+
+    emitResumeHandshake(harness.query, `model-${outcome}`);
+    harness.query.emit(highPriorityNotification(drained, `model-${outcome}`));
+    const handshakeEvents = Array.from(yield* Fiber.join(drainedFiber));
+    assert.equal(
+      handshakeEvents.some((event) => event.type === "turn.completed"),
+      false,
+    );
+
+    const usageFiber = yield* Stream.filter(
+      adapter.streamEvents,
+      (event) => event.type === "thread.token-usage.updated",
+    ).pipe(Stream.take(1), Stream.runCollect, Effect.forkChild);
+    if (outcome === "success") {
+      modelChange.resolve();
+    } else {
+      modelChange.reject(new Error("setModel failed"));
+    }
+    assert.equal(
+      (yield* Fiber.join(sendFiber))._tag,
+      outcome === "success" ? "Success" : "Failure",
+    );
+    const usageSettled = yield* Fiber.join(usageFiber).pipe(
+      Effect.timeoutOption("1 second"),
+      Effect.forkChild,
+    );
+    yield* TestClock.adjust("1 second");
+    const usageResult = yield* Fiber.join(usageSettled);
+    assert.equal(usageResult._tag, "Some");
+    if (usageResult._tag === "Some") {
+      const events = Array.from(usageResult.value);
+      assert.equal(events[0]?.turnId, undefined);
+      assert.equal(tokenUsageEvents(events)[0]?.payload.usage.maxTokens, expectedMaxTokens);
+    }
+    assert.equal(harness.query.getContextUsageCalls, 1);
+  }).pipe(
+    Effect.provideService(Random.Random, makeDeterministicRandomService()),
+    Effect.provide(harness.layer),
+  );
 }
 
 function tokenUsageEvents(events: ReadonlyArray<ProviderRuntimeEvent>) {
@@ -1232,6 +1391,88 @@ describe("ClaudeAdapterLive", () => {
         runtimeEvents.some((event) => event.type === "turn.completed"),
         false,
       );
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("keeps a late resume handshake thread-only after a user turn starts", () => {
+    const harness = makeHarness();
+    const queryStarted = makeControlledPromise<void>();
+    const handshakeUsage = makeControlledPromise<SDKControlGetContextUsageResponse>();
+    harness.query.getContextUsage = async () => {
+      harness.query.getContextUsageCalls += 1;
+      if (harness.query.getContextUsageCalls === 1) {
+        queryStarted.resolve();
+        return await handshakeUsage.promise;
+      }
+      return {
+        totalTokens: 24_000,
+        maxTokens: 200_000,
+        isAutoCompactEnabled: true,
+      } as SDKControlGetContextUsageResponse;
+    };
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const drained = "late resume handshake drained";
+      const eventsFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "runtime.warning" && event.payload.message === drained,
+      ).pipe(Stream.runCollect, Effect.forkChild);
+      yield* adapter.startSession({
+        threadId: RESUME_THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        resumeCursor: {
+          threadId: RESUME_THREAD_ID,
+          resume: "550e8400-e29b-41d4-a716-446655440000",
+          turnCount: 3,
+        },
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId: RESUME_THREAD_ID,
+        input: "start before the resume result",
+        attachments: [],
+      });
+      emitResumeHandshake(harness.query, "late");
+      yield* Effect.promise(() => queryStarted.promise);
+      handshakeUsage.resolve({
+        totalTokens: 18_000,
+        maxTokens: 200_000,
+        isAutoCompactEnabled: true,
+      } as SDKControlGetContextUsageResponse);
+      harness.query.emit(highPriorityNotification(drained, "late"));
+
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+      const usage = tokenUsageEvents(events);
+      assert.equal(usage.length, 1);
+      assert.equal(usage[0]?.turnId, undefined);
+      assert.equal(
+        events.some((event) => event.type === "turn.completed"),
+        false,
+      );
+
+      const completedFiber = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "turn.completed",
+      ).pipe(Stream.runHead, Effect.forkChild);
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        num_turns: 1,
+        usage: { total_tokens: 24_000 },
+        session_id: "550e8400-e29b-41d4-a716-446655440000",
+        uuid: "late-resume-user-result",
+      } as unknown as SDKMessage);
+      const completed = yield* Fiber.join(completedFiber);
+      assert.equal(completed._tag, "Some");
+      if (completed._tag === "Some" && completed.value.type === "turn.completed") {
+        assert.equal(String(completed.value.turnId), String(turn.turnId));
+      }
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
@@ -3156,6 +3397,986 @@ describe("ClaudeAdapterLive", () => {
           },
         },
       );
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("preserves an API-learned window for the same unknown-window model", () => {
+    const harness = makeHarness();
+    harness.query.stubContextUsage({
+      totalTokens: 18_000,
+      maxTokens: 200_000,
+      isAutoCompactEnabled: true,
+      autoCompactThreshold: 180_000,
+    } as SDKControlGetContextUsageResponse);
+    const modelSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-haiku-4-5",
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const firstCompacted = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "thread.state.changed" && event.payload.state === "compacted",
+      ).pipe(Stream.runHead, Effect.forkChild);
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection,
+        runtimeMode: "full-access",
+      });
+      harness.query.emit(compactBoundaryMessage({ post_tokens: 0 }));
+      yield* Fiber.join(firstCompacted);
+
+      const compactedFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "thread.state.changed" && event.payload.state === "compacted",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+      yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "keep the same model",
+        attachments: [],
+        modelSelection,
+      });
+      harness.query.emit(compactBoundaryMessage({ post_tokens: 500_000 }));
+
+      const events = Array.from(yield* Fiber.join(compactedFiber));
+      assert.equal(harness.query.getContextUsageCalls, 2);
+      assert.deepEqual(tokenUsageEvents(events).at(-1)?.payload.usage, {
+        usedTokens: 18_000,
+        lastUsedTokens: 18_000,
+        maxTokens: 200_000,
+        compactsAutomatically: true,
+        autoCompactThreshold: 180_000,
+      });
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("rebases cached usage when the same model changes context window", () => {
+    const harness = makeHarness();
+    harness.query.stubContextUsage({
+      totalTokens: 18_000,
+      maxTokens: 1_000_000,
+      isAutoCompactEnabled: true,
+      autoCompactThreshold: 900_000,
+    } as SDKControlGetContextUsageResponse);
+    const initialSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-opus-4-6",
+      [{ id: "contextWindow", value: "1m" }],
+    );
+    const nextSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-opus-4-6",
+      [{ id: "contextWindow", value: "200k" }],
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const firstCompacted = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "thread.state.changed" && event.payload.state === "compacted",
+      ).pipe(Stream.runHead, Effect.forkChild);
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: initialSelection,
+        runtimeMode: "full-access",
+      });
+      harness.query.emit(compactBoundaryMessage({ post_tokens: 0 }));
+      yield* Fiber.join(firstCompacted);
+
+      const progressFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "task.progress",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+      yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "use the smaller window",
+        attachments: [],
+        modelSelection: nextSelection,
+      });
+      harness.query.emit(highTaskProgressMessage());
+
+      const events = Array.from(yield* Fiber.join(progressFiber));
+      assert.deepEqual(tokenUsageEvents(events).at(-1)?.payload.usage, {
+        usedTokens: 18_000,
+        lastUsedTokens: 18_000,
+        totalProcessedTokens: 900_000,
+        maxTokens: 200_000,
+        compactsAutomatically: true,
+      });
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("discards active usage that exceeds a smaller context window", () => {
+    const harness = makeHarness();
+    harness.query.stubContextUsage({
+      totalTokens: 900_000,
+      maxTokens: 1_000_000,
+      isAutoCompactEnabled: true,
+      autoCompactThreshold: 900_000,
+    } as SDKControlGetContextUsageResponse);
+    const initialSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-opus-4-6",
+      [{ id: "contextWindow", value: "1m" }],
+    );
+    const nextSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-opus-4-6",
+      [{ id: "contextWindow", value: "200k" }],
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const firstProgress = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "task.progress",
+      ).pipe(Stream.runHead, Effect.forkChild);
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: initialSelection,
+        runtimeMode: "full-access",
+      });
+      harness.query.emit(compactBoundaryMessage({ post_tokens: 0 }));
+      harness.query.emit(highTaskProgressMessage(1_200_000));
+      yield* Fiber.join(firstProgress);
+
+      const progressFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "task.progress",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+      yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "discard the oversized active reading",
+        attachments: [],
+        modelSelection: nextSelection,
+      });
+      harness.query.emit(highTaskProgressMessage(1_300_000));
+
+      const progressEvents = Array.from(yield* Fiber.join(progressFiber));
+      assert.equal(tokenUsageEvents(progressEvents).length, 0);
+
+      const compactedFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "thread.state.changed" && event.payload.state === "compacted",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+      harness.query.emit(compactBoundaryMessage({ post_tokens: 18_000 }));
+
+      const compactedEvents = Array.from(yield* Fiber.join(compactedFiber));
+      assert.deepEqual(tokenUsageEvents(compactedEvents).at(-1)?.payload.usage, {
+        usedTokens: 18_000,
+        lastUsedTokens: 18_000,
+        totalProcessedTokens: 1_200_000,
+        maxTokens: 200_000,
+      });
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("keeps valid active usage when historical usage exceeds a smaller window", () => {
+    const harness = makeHarness();
+    const initialSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-opus-4-6",
+      [{ id: "contextWindow", value: "1m" }],
+    );
+    const nextSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-opus-4-6",
+      [{ id: "contextWindow", value: "200k" }],
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const firstCompacted = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "thread.state.changed" && event.payload.state === "compacted",
+      ).pipe(Stream.runHead, Effect.forkChild);
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: initialSelection,
+        runtimeMode: "full-access",
+      });
+      harness.query.emit(compactBoundaryMessage({ post_tokens: 18_000, pre_tokens: 900_000 }));
+      yield* Fiber.join(firstCompacted);
+
+      const progressFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "task.progress",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+      yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "keep the valid active reading",
+        attachments: [],
+        modelSelection: nextSelection,
+      });
+      harness.query.emit(highTaskProgressMessage());
+
+      const events = Array.from(yield* Fiber.join(progressFiber));
+      assert.deepEqual(tokenUsageEvents(events).at(-1)?.payload.usage, {
+        usedTokens: 18_000,
+        lastUsedTokens: 200_000,
+        totalProcessedTokens: 900_000,
+        maxTokens: 200_000,
+      });
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("clears cached window fields when the model changes to an unknown window", () => {
+    const harness = makeHarness();
+    harness.query.stubContextUsage({
+      totalTokens: 18_000,
+      maxTokens: 1_000_000,
+      isAutoCompactEnabled: true,
+      autoCompactThreshold: 900_000,
+    } as SDKControlGetContextUsageResponse);
+    const initialSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-opus-4-6",
+      [{ id: "contextWindow", value: "1m" }],
+    );
+    const nextSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-haiku-4-5",
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const firstCompacted = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "thread.state.changed" && event.payload.state === "compacted",
+      ).pipe(Stream.runHead, Effect.forkChild);
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: initialSelection,
+        runtimeMode: "full-access",
+      });
+      harness.query.emit(compactBoundaryMessage({ post_tokens: 0 }));
+      yield* Fiber.join(firstCompacted);
+
+      const progressFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "task.progress",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+      yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "change to an unknown window",
+        attachments: [],
+        modelSelection: nextSelection,
+      });
+      harness.query.emit(highTaskProgressMessage());
+
+      const events = Array.from(yield* Fiber.join(progressFiber));
+      assert.deepEqual(tokenUsageEvents(events).at(-1)?.payload.usage, {
+        usedTokens: 18_000,
+        lastUsedTokens: 18_000,
+        totalProcessedTokens: 900_000,
+        compactsAutomatically: true,
+      });
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("rejects compact usage while a model transition is pending", () => {
+    const harness = makeHarness();
+    const modelChangeStarted = makeControlledPromise<void>();
+    const modelChange = makeControlledPromise<void>();
+    const initialSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-opus-4-6",
+      [{ id: "contextWindow", value: "1m" }],
+    );
+    const nextSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-opus-4-6",
+      [{ id: "contextWindow", value: "200k" }],
+    );
+    Object.assign(harness.query, {
+      setModel: async (model?: string) => {
+        harness.query.setModelCalls.push(model);
+        modelChangeStarted.resolve();
+        await modelChange.promise;
+      },
+    });
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const drained = "compact transition drained";
+      const eventsFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "runtime.warning" && event.payload.message === drained,
+      ).pipe(Stream.runCollect, Effect.forkChild);
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: initialSelection,
+        runtimeMode: "full-access",
+      });
+      const sendFiber = yield* adapter
+        .sendTurn({
+          threadId: THREAD_ID,
+          input: "change before compact",
+          attachments: [],
+          modelSelection: nextSelection,
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.promise(() => modelChangeStarted.promise);
+
+      harness.query.emit(compactBoundaryMessage({ post_tokens: 500_000 }));
+      harness.query.emit({
+        type: "system",
+        subtype: "notification",
+        key: "compact-transition-drained",
+        text: drained,
+        priority: "high",
+        session_id: "sdk-session-compact-transition",
+        uuid: "compact-transition-drained",
+      } as unknown as SDKMessage);
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+      modelChange.resolve();
+      yield* Fiber.join(sendFiber);
+
+      assert.equal(tokenUsageEvents(events).length, 0);
+      assert.equal(
+        events.some(
+          (event) => event.type === "thread.state.changed" && event.payload.state === "compacted",
+        ),
+        true,
+      );
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("serializes concurrent model changes with their prompts", () => {
+    const harness = makeHarness();
+    const modelBStarted = makeControlledPromise<void>();
+    const releaseModelB = makeControlledPromise<void>();
+    const modelA = createModelSelection(ProviderInstanceId.make("claudeAgent"), "claude-opus-4-6", [
+      { id: "contextWindow", value: "1m" },
+    ]);
+    const modelB = createModelSelection(ProviderInstanceId.make("claudeAgent"), "claude-opus-4-6", [
+      { id: "contextWindow", value: "200k" },
+    ]);
+    Object.assign(harness.query, {
+      setModel: async (model?: string) => {
+        harness.query.setModelCalls.push(model);
+        if (model === "claude-opus-4-6") {
+          modelBStarted.resolve();
+          await releaseModelB.promise;
+        }
+      },
+    });
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: modelA,
+        runtimeMode: "full-access",
+      });
+      const prompts = harness.getLastCreateQueryInput()?.prompt[Symbol.asyncIterator]();
+
+      const sendB = yield* adapter
+        .sendTurn({
+          threadId: THREAD_ID,
+          input: "prompt for model B",
+          attachments: [],
+          modelSelection: modelB,
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.promise(() => modelBStarted.promise);
+      const sendA = yield* adapter
+        .sendTurn({
+          threadId: THREAD_ID,
+          input: "prompt for model A",
+          attachments: [],
+          modelSelection: modelA,
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      assert.equal(sendA.pollUnsafe(), undefined);
+
+      releaseModelB.resolve();
+      yield* Fiber.join(sendB);
+      yield* Fiber.join(sendA);
+      const firstPrompt = prompts ? yield* Effect.promise(() => prompts.next()) : undefined;
+      const secondPrompt = prompts ? yield* Effect.promise(() => prompts.next()) : undefined;
+      assert.deepEqual(harness.query.setModelCalls, ["claude-opus-4-6", "claude-opus-4-6[1m]"]);
+      assert.match(promptMessageText(firstPrompt?.value) ?? "", /prompt for model B/);
+      assert.match(promptMessageText(secondPrompt?.value) ?? "", /prompt for model A/);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("rejects active and queued sends after the session stops", () => {
+    const harness = makeHarness();
+    const modelChangeStarted = makeControlledPromise<void>();
+    const modelChange = makeControlledPromise<void>();
+    const initialSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-opus-4-6",
+      [{ id: "contextWindow", value: "1m" }],
+    );
+    const nextSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-opus-4-6",
+      [{ id: "contextWindow", value: "200k" }],
+    );
+    Object.assign(harness.query, {
+      setModel: async (model?: string) => {
+        harness.query.setModelCalls.push(model);
+        modelChangeStarted.resolve();
+        await modelChange.promise;
+      },
+    });
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      let sessionStarts = 0;
+      const eventsFiber = yield* Stream.takeUntil(adapter.streamEvents, (event) => {
+        if (event.type === "session.started") {
+          sessionStarts += 1;
+        }
+        return sessionStarts === 2;
+      }).pipe(Stream.runCollect, Effect.forkChild);
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: initialSelection,
+        runtimeMode: "full-access",
+      });
+      const activeSend = yield* adapter
+        .sendTurn({
+          threadId: THREAD_ID,
+          input: "active old-context send",
+          attachments: [],
+          modelSelection: nextSelection,
+        })
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Effect.promise(() => modelChangeStarted.promise);
+      const queuedSend = yield* adapter
+        .sendTurn({
+          threadId: THREAD_ID,
+          input: "queued old-context send",
+          attachments: [],
+          modelSelection: initialSelection,
+        })
+        .pipe(Effect.result, Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      const activeSettled = yield* Fiber.join(activeSend).pipe(
+        Effect.timeoutOption("1 second"),
+        Effect.forkChild,
+      );
+      const queuedSettled = yield* Fiber.join(queuedSend).pipe(
+        Effect.timeoutOption("1 second"),
+        Effect.forkChild,
+      );
+      yield* TestClock.adjust("1 second");
+      const activeResult = yield* Fiber.join(activeSettled);
+      const queuedResult = yield* Fiber.join(queuedSettled);
+      assert.equal(activeResult._tag, "Some");
+      assert.equal(queuedResult._tag, "Some");
+      if (activeResult._tag === "Some") {
+        assert.equal(activeResult.value._tag, "Failure");
+      }
+      if (queuedResult._tag === "Some") {
+        assert.equal(queuedResult.value._tag, "Failure");
+      }
+
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+      assert.equal(
+        events.some((event) => event.type === "turn.started"),
+        false,
+      );
+      assert.equal((yield* adapter.listSessions())[0]?.model, undefined);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("lets a pending model control recover when process close fails", () => {
+    const harness = makeHarness();
+    const modelChangeStarted = makeControlledPromise<void>();
+    const modelChange = makeControlledPromise<void>();
+    harness.query.closeError = new Error("close failed");
+    harness.query.stubContextUsage({
+      totalTokens: 18_000,
+      maxTokens: 200_000,
+      isAutoCompactEnabled: true,
+    } as SDKControlGetContextUsageResponse);
+    Object.assign(harness.query, {
+      setModel: async (model?: string) => {
+        harness.query.setModelCalls.push(model);
+        modelChangeStarted.resolve();
+        await modelChange.promise;
+      },
+    });
+    const initialSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-opus-4-6",
+      [{ id: "contextWindow", value: "1m" }],
+    );
+    const nextSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-opus-4-6",
+      [{ id: "contextWindow", value: "200k" }],
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: initialSelection,
+        runtimeMode: "full-access",
+      });
+      const sendFiber = yield* adapter
+        .sendTurn({
+          threadId: THREAD_ID,
+          input: "finish after failed stop",
+          attachments: [],
+          modelSelection: nextSelection,
+        })
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Effect.promise(() => modelChangeStarted.promise);
+
+      const stopResult = yield* adapter.stopSession(THREAD_ID).pipe(Effect.result);
+      assert.equal(stopResult._tag, "Failure");
+      assert.equal(yield* adapter.hasSession(THREAD_ID), true);
+
+      modelChange.resolve();
+      assert.equal((yield* Fiber.join(sendFiber))._tag, "Success");
+
+      const compactedFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "thread.state.changed" && event.payload.state === "compacted",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+      harness.query.emit(compactBoundaryMessage({ post_tokens: 500_000 }));
+      const events = Array.from(yield* Fiber.join(compactedFiber));
+      assert.equal(harness.query.getContextUsageCalls, 1);
+      assert.equal(tokenUsageEvents(events).at(-1)?.payload.usage.maxTokens, 200_000);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("stops the session when an active model control is interrupted", () => {
+    const harness = makeHarness();
+    const modelChangeStarted = makeControlledPromise<void>();
+    const modelChange = makeControlledPromise<void>();
+    Object.assign(harness.query, {
+      setModel: async (model?: string) => {
+        harness.query.setModelCalls.push(model);
+        modelChangeStarted.resolve();
+        await modelChange.promise;
+      },
+    });
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      const sendFiber = yield* adapter
+        .sendTurn({
+          threadId: THREAD_ID,
+          input: "interrupt model control",
+          attachments: [],
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("claudeAgent"),
+            "claude-opus-4-6",
+            [{ id: "contextWindow", value: "200k" }],
+          ),
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.promise(() => modelChangeStarted.promise);
+
+      yield* Fiber.interrupt(sendFiber);
+      modelChange.resolve();
+
+      assert.equal(harness.query.closeCalls, 1);
+      assert.equal(yield* adapter.hasSession(THREAD_ID), false);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("keeps an interrupted model control terminal when process close fails", () => {
+    const harness = makeHarness();
+    const modelChangeStarted = makeControlledPromise<void>();
+    const modelChange = makeControlledPromise<void>();
+    harness.query.closeError = new Error("close failed");
+    Object.assign(harness.query, {
+      setModel: async (model?: string) => {
+        harness.query.setModelCalls.push(model);
+        modelChangeStarted.resolve();
+        await modelChange.promise;
+      },
+    });
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      const sendFiber = yield* adapter
+        .sendTurn({
+          threadId: THREAD_ID,
+          input: "interrupt model control with close failure",
+          attachments: [],
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("claudeAgent"),
+            "claude-opus-4-6",
+            [{ id: "contextWindow", value: "200k" }],
+          ),
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.promise(() => modelChangeStarted.promise);
+
+      yield* Fiber.interrupt(sendFiber);
+
+      assert.equal(harness.query.closeCalls, 1);
+      assert.equal(yield* adapter.hasSession(THREAD_ID), false);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("stops the session when an active permission control is interrupted", () => {
+    const harness = makeHarness();
+    const permissionChangeStarted = makeControlledPromise<void>();
+    const permissionChange = makeControlledPromise<void>();
+    Object.assign(harness.query, {
+      setPermissionMode: async (mode: PermissionMode) => {
+        harness.query.setPermissionModeCalls.push(mode);
+        permissionChangeStarted.resolve();
+        await permissionChange.promise;
+      },
+    });
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      const sendFiber = yield* adapter
+        .sendTurn({
+          threadId: THREAD_ID,
+          input: "interrupt permission control",
+          attachments: [],
+          interactionMode: "plan",
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.promise(() => permissionChangeStarted.promise);
+
+      yield* Fiber.interrupt(sendFiber);
+
+      assert.equal(harness.query.closeCalls, 1);
+      assert.equal(yield* adapter.hasSession(THREAD_ID), false);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("keeps accepted model state after a pending model change fails", () => {
+    const harness = makeHarness();
+    const staleQueryStarted = makeControlledPromise<void>();
+    const staleUsage = makeControlledPromise<SDKControlGetContextUsageResponse>();
+    const modelChangeStarted = makeControlledPromise<void>();
+    const modelChange = makeControlledPromise<void>();
+    harness.query.getContextUsage = async () => {
+      harness.query.getContextUsageCalls += 1;
+      if (harness.query.getContextUsageCalls === 1) {
+        staleQueryStarted.resolve();
+        return await staleUsage.promise;
+      }
+      return {
+        totalTokens: 18_000,
+        maxTokens: 1_000_000,
+        isAutoCompactEnabled: true,
+        autoCompactThreshold: 900_000,
+      } as SDKControlGetContextUsageResponse;
+    };
+    Object.assign(harness.query, {
+      setModel: async (model?: string) => {
+        harness.query.setModelCalls.push(model);
+        modelChangeStarted.resolve();
+        await modelChange.promise;
+      },
+    });
+    const initialSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-opus-4-6",
+      [{ id: "contextWindow", value: "1m" }],
+    );
+    const rejectedSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-opus-4-6",
+      [{ id: "contextWindow", value: "200k" }],
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      let compacted = 0;
+      const eventsFiber = yield* Stream.takeUntil(adapter.streamEvents, (event) => {
+        if (event.type === "thread.state.changed" && event.payload.state === "compacted") {
+          compacted += 1;
+        }
+        return compacted === 2;
+      }).pipe(Stream.runCollect, Effect.forkChild);
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: initialSelection,
+        runtimeMode: "full-access",
+      });
+      harness.query.emit(compactBoundaryMessage({ post_tokens: 0 }));
+      yield* Effect.promise(() => staleQueryStarted.promise);
+
+      const sendFiber = yield* adapter
+        .sendTurn({
+          threadId: THREAD_ID,
+          input: "reject the model change",
+          attachments: [],
+          modelSelection: rejectedSelection,
+        })
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Effect.promise(() => modelChangeStarted.promise);
+      staleUsage.resolve({
+        totalTokens: 18_000,
+        maxTokens: 1_000_000,
+        isAutoCompactEnabled: true,
+        autoCompactThreshold: 900_000,
+      } as SDKControlGetContextUsageResponse);
+      modelChange.reject(new Error("setModel failed"));
+      assert.equal((yield* Fiber.join(sendFiber))._tag, "Failure");
+
+      harness.query.emit(compactBoundaryMessage({ post_tokens: 1_000_001 }));
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+      assert.equal(harness.query.getContextUsageCalls, 2);
+      assert.equal(tokenUsageEvents(events).length, 1);
+      assert.equal(tokenUsageEvents(events)[0]?.payload.usage.maxTokens, 1_000_000);
+      assert.equal((yield* adapter.listSessions())[0]?.model, "claude-opus-4-6");
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("retries resume usage after a pending model change succeeds", () =>
+    resumeUsageAfterModelChange("success"),
+  );
+
+  it.effect("retries resume usage after a pending model change fails", () =>
+    resumeUsageAfterModelChange("failure"),
+  );
+
+  it.effect("keeps a late resume handshake thread-only after an early refresh", () => {
+    const harness = makeHarness();
+    harness.query.stubContextUsage({
+      totalTokens: 18_000,
+      maxTokens: 200_000,
+      isAutoCompactEnabled: true,
+    } as SDKControlGetContextUsageResponse);
+    const initialSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-opus-4-6",
+      [{ id: "contextWindow", value: "1m" }],
+    );
+    const nextSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-opus-4-6",
+      [{ id: "contextWindow", value: "200k" }],
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: RESUME_THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: initialSelection,
+        resumeCursor: {
+          threadId: RESUME_THREAD_ID,
+          resume: "550e8400-e29b-41d4-a716-446655440000",
+          turnCount: 3,
+        },
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId: RESUME_THREAD_ID,
+        input: "refresh before the resume result",
+        attachments: [],
+        modelSelection: nextSelection,
+      });
+      assert.equal(harness.query.getContextUsageCalls, 1);
+
+      const drained = "early refresh late handshake drained";
+      const eventsFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "runtime.warning" && event.payload.message === drained,
+      ).pipe(Stream.runCollect, Effect.forkChild);
+      emitResumeHandshake(harness.query, "after-refresh");
+      harness.query.emit(highPriorityNotification(drained, "after-refresh"));
+
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+      assert.equal(
+        events.some((event) => event.type === "turn.completed"),
+        false,
+      );
+
+      const completedFiber = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "turn.completed",
+      ).pipe(Stream.runHead, Effect.forkChild);
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        num_turns: 1,
+        usage: { total_tokens: 24_000 },
+        session_id: "550e8400-e29b-41d4-a716-446655440000",
+        uuid: "early-refresh-user-result",
+      } as unknown as SDKMessage);
+      const completed = yield* Fiber.join(completedFiber);
+      assert.equal(completed._tag, "Some");
+      if (completed._tag === "Some" && completed.value.type === "turn.completed") {
+        assert.equal(String(completed.value.turnId), String(turn.turnId));
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("retries resume usage after a timed-out handshake fallback", () => {
+    const harness = makeHarness();
+    const usageQueryStarted = makeControlledPromise<void>();
+    harness.query.getContextUsage = async () => {
+      harness.query.getContextUsageCalls += 1;
+      if (harness.query.getContextUsageCalls === 1) {
+        usageQueryStarted.resolve();
+        return await new Promise<never>(() => undefined);
+      }
+      return {
+        totalTokens: 18_000,
+        maxTokens: 200_000,
+        isAutoCompactEnabled: true,
+      } as SDKControlGetContextUsageResponse;
+    };
+    const initialSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-opus-4-6",
+      [{ id: "contextWindow", value: "1m" }],
+    );
+    const nextSelection = createModelSelection(
+      ProviderInstanceId.make("claudeAgent"),
+      "claude-opus-4-6",
+      [{ id: "contextWindow", value: "200k" }],
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const firstCompacted = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "thread.state.changed" && event.payload.state === "compacted",
+      ).pipe(Stream.runHead, Effect.forkChild);
+      yield* adapter.startSession({
+        threadId: RESUME_THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: initialSelection,
+        resumeCursor: {
+          threadId: RESUME_THREAD_ID,
+          resume: "550e8400-e29b-41d4-a716-446655440000",
+          turnCount: 3,
+        },
+        runtimeMode: "full-access",
+      });
+      harness.query.emit(compactBoundaryMessage({ post_tokens: 18_000 }));
+      yield* Fiber.join(firstCompacted);
+      yield* adapter.sendTurn({
+        threadId: RESUME_THREAD_ID,
+        input: "start before the timed-out resume query",
+        attachments: [],
+      });
+
+      const drained = "timed-out resume fallback drained";
+      const drainedFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "runtime.warning" && event.payload.message === drained,
+      ).pipe(Stream.runCollect, Effect.forkChild);
+      emitResumeHandshake(harness.query, "timeout-fallback");
+      harness.query.emit(highPriorityNotification(drained, "timeout-fallback"));
+      yield* Effect.promise(() => usageQueryStarted.promise);
+      yield* TestClock.adjust("1 second");
+      const handshakeEvents = Array.from(yield* Fiber.join(drainedFiber));
+      assert.equal(tokenUsageEvents(handshakeEvents).at(-1)?.payload.usage.maxTokens, 1_000_000);
+
+      const usageFiber = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "thread.token-usage.updated",
+      ).pipe(Stream.take(1), Stream.runCollect, Effect.forkChild);
+      yield* adapter.sendTurn({
+        threadId: RESUME_THREAD_ID,
+        input: "retry usage on the model transition",
+        attachments: [],
+        modelSelection: nextSelection,
+      });
+      const usageSettled = yield* Fiber.join(usageFiber).pipe(
+        Effect.timeoutOption("1 second"),
+        Effect.forkChild,
+      );
+      yield* TestClock.adjust("1 second");
+      const usageResult = yield* Fiber.join(usageSettled);
+      assert.equal(usageResult._tag, "Some");
+      if (usageResult._tag === "Some") {
+        const events = Array.from(usageResult.value);
+        assert.equal(events[0]?.turnId, undefined);
+        assert.equal(tokenUsageEvents(events)[0]?.payload.usage.maxTokens, 200_000);
+      }
+      assert.equal(harness.query.getContextUsageCalls, 2);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
