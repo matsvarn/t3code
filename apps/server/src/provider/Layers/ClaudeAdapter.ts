@@ -322,7 +322,6 @@ interface ClaudeSessionContext {
   lastThreadStartedId: string | undefined;
   resumeHandshakePending: boolean;
   resumeUsageRefreshNeeded: boolean;
-  stopInProgress: boolean;
   stopped: boolean;
 }
 
@@ -331,6 +330,8 @@ interface ClaudeTokenUsageObservation {
   readonly usage: ThreadTokenUsageSnapshot | undefined;
   readonly contextWindow?: number;
 }
+
+type ClaudeSessionExitPolicy = "always" | "on-error" | "never";
 
 interface ClaudeQueryRuntime extends AsyncIterable<SDKMessage> {
   readonly setModel: (model?: string) => Promise<void>;
@@ -2206,6 +2207,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
   ) {
     if (
       !context.query.getContextUsage ||
+      context.stopped ||
       context.modelTransitionInFlight ||
       context.modelRevision !== expectedModelRevision
     ) {
@@ -2219,7 +2221,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         return undefined;
       }
     }).pipe(Effect.timeoutOption("1 second"));
-    if (Option.isNone(usage) || !usage.value) {
+    if (context.stopped || Option.isNone(usage) || !usage.value) {
       return undefined;
     }
 
@@ -3839,60 +3841,34 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     }
 
     yield* stopSessionInternal(context, {
-      emitExitEvent: true,
+      exitPolicy: "always",
     });
   });
 
   const stopSessionInternal = Effect.fn("stopSessionInternal")(function* (
     context: ClaudeSessionContext,
-    options?: {
-      readonly emitExitEvent?: boolean;
-      readonly terminalOnCloseFailure?: boolean;
-    },
+    options?: { readonly exitPolicy?: ClaudeSessionExitPolicy },
   ) {
-    if (context.stopped || context.stopInProgress) return;
+    if (context.stopped) return;
+
+    context.stopped = true;
+    yield* Deferred.succeed(context.stopSignal, undefined);
 
     // Schedule process termination before any cleanup that can wait on the
     // provider. The SDK closes stdin, then escalates from SIGTERM to SIGKILL.
-    const terminalOnCloseFailure = options?.terminalOnCloseFailure === true;
-    const closeError = yield* Effect.uninterruptible(
-      Effect.gen(function* () {
-        if (terminalOnCloseFailure) {
-          context.stopped = true;
-          yield* Deferred.succeed(context.stopSignal, undefined);
-        } else {
-          context.stopInProgress = true;
-        }
-        const error = yield* Effect.sync(() => {
-          try {
-            context.query.close();
-            context.stopped = true;
-            return undefined;
-          } catch (cause) {
-            return new ProviderAdapterProcessError({
-              provider: PROVIDER,
-              threadId: context.session.threadId,
-              detail: "Failed to close Claude runtime query.",
-              cause,
-            });
-          } finally {
-            context.stopInProgress = false;
-          }
+    const closeError = yield* Effect.sync(() => {
+      try {
+        context.query.close();
+        return undefined;
+      } catch (cause) {
+        return new ProviderAdapterProcessError({
+          provider: PROVIDER,
+          threadId: context.session.threadId,
+          detail: "Failed to close Claude runtime query.",
+          cause,
         });
-        if (!error && !terminalOnCloseFailure) {
-          yield* Deferred.succeed(context.stopSignal, undefined);
-        }
-        return error;
-      }),
-    );
-    if (closeError) {
-      if (!terminalOnCloseFailure) {
-        return yield* closeError;
       }
-      yield* Effect.logError("Failed to close interrupted Claude model control.", {
-        cause: closeError,
-      });
-    }
+    });
 
     for (const taskId of Array.from(context.liveTaskIds)) {
       if (!context.liveTaskIds.delete(taskId)) {
@@ -3961,7 +3937,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       updatedAt,
     };
 
-    if (options?.emitExitEvent !== false && sessions.get(context.session.threadId) === context) {
+    const exitPolicy = options?.exitPolicy ?? "always";
+    const emitExitEvent =
+      exitPolicy === "always" || (exitPolicy === "on-error" && closeError !== undefined);
+    if (emitExitEvent && sessions.get(context.session.threadId) === context) {
       const stamp = yield* makeEventStamp();
       yield* offerRuntimeEvent({
         type: "session.exited",
@@ -3969,10 +3948,16 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         provider: PROVIDER,
         createdAt: stamp.createdAt,
         threadId: context.session.threadId,
-        payload: {
-          reason: "Session stopped",
-          exitKind: "graceful",
-        },
+        payload: closeError
+          ? {
+              reason: closeError.detail,
+              recoverable: false,
+              exitKind: "error",
+            }
+          : {
+              reason: "Session stopped",
+              exitKind: "graceful",
+            },
         providerRefs: {},
       });
     }
@@ -3980,7 +3965,11 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     if (sessions.get(context.session.threadId) === context) {
       sessions.delete(context.session.threadId);
     }
-  });
+
+    if (closeError) {
+      return yield* closeError;
+    }
+  }, Effect.uninterruptible);
 
   const requireSession = (
     threadId: ThreadId,
@@ -3994,7 +3983,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         }),
       );
     }
-    if (context.stopInProgress || context.stopped || context.session.status === "closed") {
+    if (context.stopped || context.session.status === "closed") {
       return Effect.fail(
         new ProviderAdapterSessionClosedError({
           provider: PROVIDER,
@@ -4009,9 +3998,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     context: ClaudeSessionContext,
   ): Effect.Effect<void, ProviderAdapterSessionClosedError> =>
     Effect.suspend(() =>
-      context.stopInProgress ||
-      context.stopped ||
-      sessions.get(context.session.threadId) !== context
+      context.stopped || sessions.get(context.session.threadId) !== context
         ? Effect.fail(
             new ProviderAdapterSessionClosedError({
               provider: PROVIDER,
@@ -4039,10 +4026,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       ),
     ).pipe(
       Effect.onInterrupt(() =>
-        stopSessionInternal(context, {
-          emitExitEvent: true,
-          terminalOnCloseFailure: true,
-        }).pipe(
+        stopSessionInternal(context, { exitPolicy: "always" }).pipe(
           Effect.catchCause((cause) =>
             Effect.logError("Failed to stop interrupted Claude session control.", { cause }),
           ),
@@ -4068,7 +4052,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           reason: "startSession called with existing active session",
         });
         yield* stopSessionInternal(existingContext, {
-          emitExitEvent: false,
+          exitPolicy: "on-error",
         });
       }
 
@@ -4670,7 +4654,6 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         lastThreadStartedId: undefined,
         resumeHandshakePending: existingResumeSessionId !== undefined,
         resumeUsageRefreshNeeded: existingResumeSessionId !== undefined,
-        stopInProgress: false,
         stopped: false,
       };
       yield* Ref.set(contextRef, context);
@@ -4980,7 +4963,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     function* (threadId) {
       const context = yield* requireSession(threadId);
       yield* stopSessionInternal(context, {
-        emitExitEvent: true,
+        exitPolicy: "always",
       });
     },
   );
@@ -4996,10 +4979,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
   const stopSessions = Effect.fn("stopSessions")(function* (
     contexts: ReadonlyArray<ClaudeSessionContext>,
-    emitExitEvent: boolean,
+    exitPolicy: ClaudeSessionExitPolicy,
   ) {
     const results = yield* Effect.forEach(contexts, (context) =>
-      stopSessionInternal(context, { emitExitEvent }).pipe(Effect.result),
+      stopSessionInternal(context, { exitPolicy }).pipe(Effect.result),
     );
 
     for (const result of results) {
@@ -5010,10 +4993,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
   });
 
   const stopAll: ClaudeAdapterShape["stopAll"] = () =>
-    stopSessions(Array.from(sessions.values()), true);
+    stopSessions(Array.from(sessions.values()), "always");
 
   yield* Effect.addFinalizer(() =>
-    stopSessions(Array.from(sessions.values()), false).pipe(
+    stopSessions(Array.from(sessions.values()), "never").pipe(
       Effect.catch((cause) =>
         Effect.logError("Failed to emit Claude session shutdown event.", { cause }),
       ),

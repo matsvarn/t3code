@@ -2100,22 +2100,31 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("keeps the session and stream available when process close fails", () => {
+  it.effect("finishes session cleanup when process close fails", () => {
     const harness = makeHarness();
-    let availableDuringClose: boolean | undefined;
+    let hasSessionDuringClose: boolean | undefined;
     let sendFailedDuringClose: boolean | undefined;
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
       const runtimeContext = yield* Effect.context<never>();
       const runSync = Effect.runSyncWith(runtimeContext);
+      const sessionEventsFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "session.exited",
+      ).pipe(Stream.runCollect, Effect.forkChild);
       const session = yield* adapter.startSession({
         threadId: THREAD_ID,
         provider: ProviderDriverKind.make("claudeAgent"),
         runtimeMode: "full-access",
       });
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "stop after close failure",
+        attachments: [],
+      });
       (harness.query as { close: () => void }).close = () => {
         harness.query.closeCalls += 1;
-        availableDuringClose = runSync(adapter.hasSession(session.threadId));
+        hasSessionDuringClose = runSync(adapter.hasSession(session.threadId));
         sendFailedDuringClose =
           runSync(
             adapter
@@ -2136,17 +2145,15 @@ describe("ClaudeAdapterLive", () => {
         assert.equal(result.failure._tag, "ProviderAdapterProcessError");
       }
       assert.equal(harness.query.closeCalls, 1);
-      assert.equal(availableDuringClose, true);
+      assert.equal(hasSessionDuringClose, false);
       assert.equal(sendFailedDuringClose, true);
-      assert.equal(yield* adapter.hasSession(session.threadId), true);
-      assert.equal((yield* adapter.listSessions())[0]?.status, "ready");
-
-      const warningFiber = yield* Stream.filter(
-        adapter.streamEvents,
-        (event) => event.type === "runtime.warning" && event.payload.message === "still running",
-      ).pipe(Stream.runHead, Effect.forkChild);
-      harness.query.emit(highPriorityNotification("still running", "after-close-failure"));
-      assert.equal((yield* Fiber.join(warningFiber))._tag, "Some");
+      const sessionEvents = Array.from(yield* Fiber.join(sessionEventsFiber));
+      assert.deepEqual(
+        sessionEvents.slice(-2).map((event) => event.type),
+        ["turn.completed", "session.exited"],
+      );
+      assert.equal(yield* adapter.hasSession(session.threadId), false);
+      assert.equal((yield* adapter.listSessions()).length, 0);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
@@ -2196,20 +2203,17 @@ describe("ClaudeAdapterLive", () => {
       assert.equal(result._tag, "Failure");
       assert.equal(queries[0]?.closeCalls, 1);
       assert.equal(queries[1]?.closeCalls, 1);
-      assert.equal(yield* adapter.hasSession(THREAD_ID), true);
+      assert.equal(yield* adapter.hasSession(THREAD_ID), false);
       assert.equal(yield* adapter.hasSession(RESUME_THREAD_ID), false);
+      assert.equal((yield* adapter.listSessions()).length, 0);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(layer),
     );
   });
 
-  it.effect("keeps a resumed replacement session during slow stop cleanup", () => {
+  it.effect("allows a replacement retry after process close fails", () => {
     const queries: FakeClaudeQuery[] = [];
-    let signalUsageStarted: () => void = () => undefined;
-    const usageStarted = new Promise<void>((resolve) => {
-      signalUsageStarted = resolve;
-    });
     const layer = Layer.effect(
       ClaudeAdapter,
       Effect.gen(function* () {
@@ -2217,14 +2221,6 @@ describe("ClaudeAdapterLive", () => {
         return yield* makeClaudeAdapter(claudeConfig, {
           createQuery: () => {
             const query = new FakeClaudeQuery();
-            if (queries.length === 0) {
-              Object.assign(query, {
-                getContextUsage: async () => {
-                  signalUsageStarted();
-                  return await new Promise<never>(() => undefined);
-                },
-              });
-            }
             queries.push(query);
             return query;
           },
@@ -2238,7 +2234,7 @@ describe("ClaudeAdapterLive", () => {
 
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
-      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 8).pipe(
+      const initialEventsFiber = yield* Stream.take(adapter.streamEvents, 3).pipe(
         Stream.runCollect,
         Effect.forkChild,
       );
@@ -2247,46 +2243,69 @@ describe("ClaudeAdapterLive", () => {
         provider: ProviderDriverKind.make("claudeAgent"),
         runtimeMode: "full-access",
       });
-      yield* adapter.sendTurn({
-        threadId: firstSession.threadId,
-        input: "hello",
-        attachments: [],
-      });
+      assert.deepEqual(
+        Array.from(yield* Fiber.join(initialEventsFiber)).map((event) => event.type),
+        ["session.started", "session.configured", "session.state.changed"],
+      );
+      const firstQuery = queries[0];
+      if (!firstQuery) {
+        return;
+      }
+      firstQuery.closeError = new Error("close failed");
 
-      const interruptFiber = yield* adapter
-        .interruptTurn(firstSession.threadId)
-        .pipe(Effect.forkChild);
-      yield* Effect.promise(() => usageStarted);
+      const failedReplacement = yield* adapter
+        .startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+          resumeCursor: firstSession.resumeCursor,
+        })
+        .pipe(Effect.result);
+      assert.equal(failedReplacement._tag, "Failure");
+      if (failedReplacement._tag === "Failure") {
+        assert.equal(failedReplacement.failure._tag, "ProviderAdapterProcessError");
+      }
       assert.equal(queries[0]?.closeCalls, 1);
+      assert.equal(yield* adapter.hasSession(THREAD_ID), false);
+      assert.equal((yield* adapter.listSessions()).length, 0);
 
+      const failedExitFiber = yield* Stream.runHead(adapter.streamEvents).pipe(
+        Effect.timeoutOption("1 second"),
+        Effect.forkChild,
+      );
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("1 second");
+      const failedExit = yield* Fiber.join(failedExitFiber);
+      assert.equal(failedExit._tag, "Some");
+      if (failedExit._tag === "Some") {
+        assert.equal(failedExit.value._tag, "Some");
+        if (failedExit.value._tag === "Some") {
+          assert.equal(failedExit.value.value.type, "session.exited");
+          if (failedExit.value.value.type === "session.exited") {
+            assert.equal(failedExit.value.value.payload.exitKind, "error");
+            assert.equal(failedExit.value.value.payload.recoverable, false);
+          }
+        }
+      }
+
+      const retryStartedFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
       const replacement = yield* adapter.startSession({
         threadId: THREAD_ID,
         provider: ProviderDriverKind.make("claudeAgent"),
         runtimeMode: "full-access",
         resumeCursor: firstSession.resumeCursor,
       });
-      yield* TestClock.adjust("1 second");
-      yield* Fiber.join(interruptFiber);
+      const retryStarted = yield* Fiber.join(retryStartedFiber);
+      assert.equal(retryStarted._tag, "Some");
+      if (retryStarted._tag === "Some") {
+        assert.equal(retryStarted.value.type, "session.started");
+      }
 
       const activeSessions = yield* adapter.listSessions();
-      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
       assert.equal(queries.length, 2);
       assert.equal(queries[1]?.closeCalls, 0);
       assert.equal(activeSessions.length, 1);
       assert.deepEqual(activeSessions[0]?.resumeCursor, replacement.resumeCursor);
-      assert.deepEqual(
-        runtimeEvents
-          .filter((event) => event.type.startsWith("session."))
-          .map((event) => event.type),
-        [
-          "session.started",
-          "session.configured",
-          "session.state.changed",
-          "session.started",
-          "session.configured",
-          "session.state.changed",
-        ],
-      );
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(layer),
@@ -2597,6 +2616,37 @@ describe("ClaudeAdapterLive", () => {
       const sessions = yield* adapter.listSessions();
       assert.equal(sessions.length, 0);
       assert.equal(harness.query.closeCalls, 1);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("finishes session cleanup when process close fails after stream exit", () => {
+    const harness = makeHarness();
+    harness.query.closeError = new Error("close failed");
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const sessionExitedFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "session.exited",
+      ).pipe(Stream.runCollect, Effect.timeoutOption("1 second"), Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      harness.query.finish();
+
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("1 second");
+      const sessionExited = yield* Fiber.join(sessionExitedFiber);
+      assert.equal(sessionExited._tag, "Some");
+      assert.equal(harness.query.closeCalls, 1);
+      assert.equal(yield* adapter.hasSession(THREAD_ID), false);
+      assert.equal((yield* adapter.listSessions()).length, 0);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
@@ -3953,21 +4003,16 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("lets a pending model control recover when process close fails", () => {
+  it.effect("settles active and queued sends when process close fails", () => {
     const harness = makeHarness();
     const modelChangeStarted = makeControlledPromise<void>();
-    const modelChange = makeControlledPromise<void>();
+    const modelChange = new Promise<never>(() => undefined);
     harness.query.closeError = new Error("close failed");
-    harness.query.stubContextUsage({
-      totalTokens: 18_000,
-      maxTokens: 200_000,
-      isAutoCompactEnabled: true,
-    } as SDKControlGetContextUsageResponse);
     Object.assign(harness.query, {
       setModel: async (model?: string) => {
         harness.query.setModelCalls.push(model);
         modelChangeStarted.resolve();
-        await modelChange.promise;
+        await modelChange;
       },
     });
     const initialSelection = createModelSelection(
@@ -3998,22 +4043,72 @@ describe("ClaudeAdapterLive", () => {
         })
         .pipe(Effect.result, Effect.forkChild);
       yield* Effect.promise(() => modelChangeStarted.promise);
+      const queuedSendFiber = yield* adapter
+        .sendTurn({
+          threadId: THREAD_ID,
+          input: "queued after failed stop",
+          attachments: [],
+          modelSelection: initialSelection,
+        })
+        .pipe(Effect.result, Effect.forkChild);
 
       const stopResult = yield* adapter.stopSession(THREAD_ID).pipe(Effect.result);
       assert.equal(stopResult._tag, "Failure");
-      assert.equal(yield* adapter.hasSession(THREAD_ID), true);
+      if (stopResult._tag === "Failure") {
+        assert.equal(stopResult.failure._tag, "ProviderAdapterProcessError");
+      }
+      const activeSettledFiber = yield* Fiber.join(sendFiber).pipe(
+        Effect.timeoutOption("1 second"),
+        Effect.forkChild,
+      );
+      const queuedSettledFiber = yield* Fiber.join(queuedSendFiber).pipe(
+        Effect.timeoutOption("1 second"),
+        Effect.forkChild,
+      );
+      yield* TestClock.adjust("1 second");
+      const activeSettled = yield* Fiber.join(activeSettledFiber);
+      const queuedSettled = yield* Fiber.join(queuedSettledFiber);
+      assert.equal(activeSettled._tag, "Some");
+      assert.equal(queuedSettled._tag, "Some");
+      if (activeSettled._tag === "Some") {
+        assert.equal(activeSettled.value._tag, "Failure");
+      }
+      if (queuedSettled._tag === "Some") {
+        assert.equal(queuedSettled.value._tag, "Failure");
+      }
+      assert.equal(yield* adapter.hasSession(THREAD_ID), false);
+      assert.equal((yield* adapter.listSessions()).length, 0);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
 
-      modelChange.resolve();
-      assert.equal((yield* Fiber.join(sendFiber))._tag, "Success");
+  it.effect("does not query context usage while stopping an active turn", () => {
+    const harness = makeHarness();
+    harness.query.stubContextUsage({
+      totalTokens: 18_000,
+      maxTokens: 200_000,
+      isAutoCompactEnabled: true,
+    } as SDKControlGetContextUsageResponse);
 
-      const compactedFiber = yield* Stream.takeUntil(
-        adapter.streamEvents,
-        (event) => event.type === "thread.state.changed" && event.payload.state === "compacted",
-      ).pipe(Stream.runCollect, Effect.forkChild);
-      harness.query.emit(compactBoundaryMessage({ post_tokens: 500_000 }));
-      const events = Array.from(yield* Fiber.join(compactedFiber));
-      assert.equal(harness.query.getContextUsageCalls, 1);
-      assert.equal(tokenUsageEvents(events).at(-1)?.payload.usage.maxTokens, 200_000);
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "stop without usage query",
+        attachments: [],
+      });
+
+      yield* adapter.stopSession(THREAD_ID);
+
+      assert.equal(harness.query.getContextUsageCalls, 0);
+      assert.equal(yield* adapter.hasSession(THREAD_ID), false);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
