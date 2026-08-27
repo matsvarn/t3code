@@ -329,6 +329,8 @@ interface ClaudeTokenUsageObservation {
   readonly modelRevision: number;
   readonly usage: ThreadTokenUsageSnapshot | undefined;
   readonly contextWindow?: number;
+  readonly compactsAutomatically?: boolean;
+  readonly autoCompactThreshold?: number;
 }
 
 type ClaudeSessionExitPolicy = "always" | "on-error" | "never";
@@ -628,14 +630,51 @@ function normalizeClaudeContextUsageApiSnapshot(
   value: SDKControlGetContextUsageResponse,
   totalProcessedTokens?: number,
 ): ThreadTokenUsageSnapshot | undefined {
-  const autoCompactThreshold = finitePositiveInteger(value.autoCompactThreshold);
+  const policy = normalizeClaudeContextUsagePolicy(value);
   return makeClaudeTokenUsageSnapshot({
     activeTokens: value.totalTokens,
     contextWindow: value.maxTokens,
     ...(totalProcessedTokens !== undefined ? { totalProcessedTokens } : {}),
-    compactsAutomatically: value.isAutoCompactEnabled,
-    ...(autoCompactThreshold !== undefined ? { autoCompactThreshold } : {}),
+    ...policy,
   });
+}
+
+function normalizeClaudeContextUsagePolicy(
+  value: SDKControlGetContextUsageResponse,
+): Pick<ClaudeTokenUsageObservation, "compactsAutomatically" | "autoCompactThreshold"> {
+  const compactsAutomatically =
+    typeof value.isAutoCompactEnabled === "boolean" ? value.isAutoCompactEnabled : undefined;
+  const autoCompactThreshold = finitePositiveInteger(value.autoCompactThreshold);
+  return {
+    ...(compactsAutomatically !== undefined ? { compactsAutomatically } : {}),
+    ...(compactsAutomatically === true && autoCompactThreshold !== undefined
+      ? { autoCompactThreshold }
+      : {}),
+  };
+}
+
+function applyClaudeContextUsagePolicy(
+  usage: ThreadTokenUsageSnapshot | undefined,
+  observation: ClaudeTokenUsageObservation | undefined,
+): ThreadTokenUsageSnapshot | undefined {
+  if (!usage || !observation) {
+    return usage;
+  }
+
+  const next = { ...usage };
+  if (observation.compactsAutomatically !== undefined) {
+    next.compactsAutomatically = observation.compactsAutomatically;
+    if (!observation.compactsAutomatically) {
+      delete next.autoCompactThreshold;
+    }
+  }
+  if (
+    observation.compactsAutomatically === true &&
+    observation.autoCompactThreshold !== undefined
+  ) {
+    next.autoCompactThreshold = observation.autoCompactThreshold;
+  }
+  return next;
 }
 
 function compactBoundaryTokenUsageSnapshot(
@@ -2225,10 +2264,12 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       return undefined;
     }
 
+    const policy = normalizeClaudeContextUsagePolicy(usage.value);
     return {
       modelRevision: expectedModelRevision,
       usage: normalizeClaudeContextUsageApiSnapshot(usage.value, totalProcessedTokens),
       contextWindow: usage.value.maxTokens,
+      ...policy,
     } satisfies ClaudeTokenUsageObservation;
   });
 
@@ -2423,7 +2464,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         )
       : undefined;
     const lastGoodUsage = context.lastKnownTokenUsage;
-    const usageSnapshot: ThreadTokenUsageSnapshot | undefined =
+    const selectedUsageSnapshot: ThreadTokenUsageSnapshot | undefined =
       contextUsageObservation?.usage ??
       (resultTotalOnly && lastGoodUsage
         ? {
@@ -2455,6 +2496,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
               : {}),
           }
         : undefined);
+    const usageSnapshot = applyClaudeContextUsagePolicy(
+      selectedUsageSnapshot,
+      contextUsageObservation,
+    );
     const observationContextWindow = contextUsageObservation?.contextWindow ?? resultContextWindow;
     const usageObservation: ClaudeTokenUsageObservation = {
       modelRevision: contextUsageObservation?.modelRevision ?? modelRevision,

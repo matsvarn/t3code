@@ -4819,12 +4819,13 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("uses result usage when authoritative context usage has no active total", () => {
+  it.effect("keeps context policy when authoritative usage has no active total", () => {
     const harness = makeHarness();
     harness.query.stubContextUsage({
       totalTokens: 0,
       maxTokens: 200_000,
       isAutoCompactEnabled: true,
+      autoCompactThreshold: 180_000,
     } as SDKControlGetContextUsageResponse);
 
     return Effect.gen(function* () {
@@ -4867,6 +4868,124 @@ describe("ClaudeAdapterLive", () => {
         inputTokens: 1_000,
         outputTokens: 500,
         maxTokens: 200_000,
+        compactsAutomatically: true,
+        autoCompactThreshold: 180_000,
+      });
+
+      const cachedEventsFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "task.progress",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+      harness.query.emit(highTaskProgressMessage());
+      const cachedEvents = Array.from(yield* Fiber.join(cachedEventsFiber));
+      assert.deepEqual(tokenUsageEvents(cachedEvents).at(-1)?.payload.usage, {
+        usedTokens: 1_500,
+        lastUsedTokens: 1_500,
+        totalProcessedTokens: 900_000,
+        inputTokens: 1_000,
+        outputTokens: 500,
+        maxTokens: 200_000,
+        compactsAutomatically: true,
+        autoCompactThreshold: 180_000,
+      });
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("clears stale compact policy when fresh context usage disables it", () => {
+    const harness = makeHarness();
+    const responses: ReadonlyArray<SDKControlGetContextUsageResponse> = [
+      {
+        totalTokens: 18_000,
+        maxTokens: 200_000,
+        isAutoCompactEnabled: true,
+        autoCompactThreshold: 180_000,
+      } as SDKControlGetContextUsageResponse,
+      {
+        totalTokens: 0,
+        maxTokens: 200_000,
+        isAutoCompactEnabled: false,
+        autoCompactThreshold: 170_000,
+      } as SDKControlGetContextUsageResponse,
+    ];
+    harness.query.getContextUsage = async () => {
+      const response = responses[harness.query.getContextUsageCalls];
+      harness.query.getContextUsageCalls += 1;
+      assert.isDefined(response);
+      return response;
+    };
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      const firstCompleted = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "turn.completed",
+      ).pipe(Stream.runHead, Effect.forkChild);
+      yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "establish compact policy",
+        attachments: [],
+      });
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        num_turns: 1,
+        result: "done",
+        session_id: "sdk-session-compact-policy-enabled",
+        usage: { input_tokens: 1_000, output_tokens: 500 },
+      } as unknown as SDKMessage);
+      yield* Fiber.join(firstCompleted);
+
+      const secondEventsFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "turn.completed",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+      yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "disable compact policy",
+        attachments: [],
+      });
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        num_turns: 1,
+        result: "done",
+        session_id: "sdk-session-compact-policy-disabled",
+        usage: { total_tokens: 24_000 },
+      } as unknown as SDKMessage);
+
+      const secondEvents = Array.from(yield* Fiber.join(secondEventsFiber));
+      assert.equal(harness.query.getContextUsageCalls, 2);
+      assert.deepEqual(tokenUsageEvents(secondEvents).at(-1)?.payload.usage, {
+        usedTokens: 18_000,
+        lastUsedTokens: 18_000,
+        totalProcessedTokens: 24_000,
+        maxTokens: 200_000,
+        compactsAutomatically: false,
+      });
+
+      const cachedEventsFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "task.progress",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+      harness.query.emit(highTaskProgressMessage());
+      const cachedEvents = Array.from(yield* Fiber.join(cachedEventsFiber));
+      assert.deepEqual(tokenUsageEvents(cachedEvents).at(-1)?.payload.usage, {
+        usedTokens: 18_000,
+        lastUsedTokens: 18_000,
+        totalProcessedTokens: 900_000,
+        maxTokens: 200_000,
+        compactsAutomatically: false,
       });
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
