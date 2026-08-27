@@ -322,6 +322,7 @@ interface ClaudeSessionContext {
   lastThreadStartedId: string | undefined;
   resumeHandshakePending: boolean;
   resumeUsageRefreshNeeded: boolean;
+  stopInProgress: boolean;
   stopped: boolean;
 }
 
@@ -2377,7 +2378,6 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       context.resumeHandshakePending = false;
     }
     const resultContextWindow = maxClaudeContextWindowFromModelUsage(result?.modelUsage);
-    const maxTokens = resultContextWindow ?? context.lastKnownContextWindow;
     const reportedTotalProcessedTokens = claudeTotalProcessedTokens(result?.usage);
     const accumulatedTotalProcessedTokens =
       reportedTotalProcessedTokens !== undefined
@@ -2395,6 +2395,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       accumulatedTotalProcessedTokens ?? context.lastKnownTotalProcessedTokens,
       modelRevision,
     );
+    const maxTokens =
+      contextUsageObservation?.contextWindow ??
+      resultContextWindow ??
+      context.lastKnownContextWindow;
     const resultUsageRecord =
       result?.usage && typeof result.usage === "object" && !Array.isArray(result.usage)
         ? (result.usage as Record<string, unknown>)
@@ -2449,10 +2453,13 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
               : {}),
           }
         : undefined);
-    const usageObservation: ClaudeTokenUsageObservation = contextUsageObservation ?? {
-      modelRevision,
+    const observationContextWindow = contextUsageObservation?.contextWindow ?? resultContextWindow;
+    const usageObservation: ClaudeTokenUsageObservation = {
+      modelRevision: contextUsageObservation?.modelRevision ?? modelRevision,
       usage: usageSnapshot,
-      ...(resultContextWindow !== undefined ? { contextWindow: resultContextWindow } : {}),
+      ...(observationContextWindow !== undefined
+        ? { contextWindow: observationContextWindow }
+        : {}),
     };
 
     const turnState = resumeHandshake ? undefined : context.turnState;
@@ -2464,7 +2471,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       });
       if (
         resumeHandshake &&
-        contextUsageObservation !== undefined &&
+        contextUsageObservation?.usage !== undefined &&
         usageAccepted &&
         !context.modelTransitionInFlight &&
         context.modelRevision === usageObservation.modelRevision
@@ -3843,40 +3850,47 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       readonly terminalOnCloseFailure?: boolean;
     },
   ) {
-    if (context.stopped) return;
+    if (context.stopped || context.stopInProgress) return;
 
     // Schedule process termination before any cleanup that can wait on the
     // provider. The SDK closes stdin, then escalates from SIGTERM to SIGKILL.
     const terminalOnCloseFailure = options?.terminalOnCloseFailure === true;
-    const closeResult = yield* Effect.uninterruptible(
+    const closeError = yield* Effect.uninterruptible(
       Effect.gen(function* () {
-        context.stopped = true;
         if (terminalOnCloseFailure) {
+          context.stopped = true;
           yield* Deferred.succeed(context.stopSignal, undefined);
+        } else {
+          context.stopInProgress = true;
         }
-        const result = yield* Effect.try({
-          try: () => context.query.close(),
-          catch: (cause) =>
-            new ProviderAdapterProcessError({
+        const error = yield* Effect.sync(() => {
+          try {
+            context.query.close();
+            context.stopped = true;
+            return undefined;
+          } catch (cause) {
+            return new ProviderAdapterProcessError({
               provider: PROVIDER,
               threadId: context.session.threadId,
               detail: "Failed to close Claude runtime query.",
               cause,
-            }),
-        }).pipe(Effect.result);
-        if (result._tag === "Success" && !terminalOnCloseFailure) {
+            });
+          } finally {
+            context.stopInProgress = false;
+          }
+        });
+        if (!error && !terminalOnCloseFailure) {
           yield* Deferred.succeed(context.stopSignal, undefined);
         }
-        return result;
+        return error;
       }),
     );
-    if (closeResult._tag === "Failure") {
+    if (closeError) {
       if (!terminalOnCloseFailure) {
-        context.stopped = false;
-        return yield* closeResult.failure;
+        return yield* closeError;
       }
       yield* Effect.logError("Failed to close interrupted Claude model control.", {
-        cause: closeResult.failure,
+        cause: closeError,
       });
     }
 
@@ -3980,7 +3994,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         }),
       );
     }
-    if (context.stopped || context.session.status === "closed") {
+    if (context.stopInProgress || context.stopped || context.session.status === "closed") {
       return Effect.fail(
         new ProviderAdapterSessionClosedError({
           provider: PROVIDER,
@@ -3995,7 +4009,9 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     context: ClaudeSessionContext,
   ): Effect.Effect<void, ProviderAdapterSessionClosedError> =>
     Effect.suspend(() =>
-      context.stopped || sessions.get(context.session.threadId) !== context
+      context.stopInProgress ||
+      context.stopped ||
+      sessions.get(context.session.threadId) !== context
         ? Effect.fail(
             new ProviderAdapterSessionClosedError({
               provider: PROVIDER,
@@ -4654,6 +4670,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         lastThreadStartedId: undefined,
         resumeHandshakePending: existingResumeSessionId !== undefined,
         resumeUsageRefreshNeeded: existingResumeSessionId !== undefined,
+        stopInProgress: false,
         stopped: false,
       };
       yield* Ref.set(contextRef, context);

@@ -2100,16 +2100,34 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("keeps the session available when process close fails", () => {
+  it.effect("keeps the session and stream available when process close fails", () => {
     const harness = makeHarness();
+    let availableDuringClose: boolean | undefined;
+    let sendFailedDuringClose: boolean | undefined;
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
+      const runtimeContext = yield* Effect.context<never>();
+      const runSync = Effect.runSyncWith(runtimeContext);
       const session = yield* adapter.startSession({
         threadId: THREAD_ID,
         provider: ProviderDriverKind.make("claudeAgent"),
         runtimeMode: "full-access",
       });
-      harness.query.closeError = new Error("close failed");
+      (harness.query as { close: () => void }).close = () => {
+        harness.query.closeCalls += 1;
+        availableDuringClose = runSync(adapter.hasSession(session.threadId));
+        sendFailedDuringClose =
+          runSync(
+            adapter
+              .sendTurn({
+                threadId: session.threadId,
+                input: "reject during close",
+                attachments: [],
+              })
+              .pipe(Effect.result),
+          )._tag === "Failure";
+        throw new Error("close failed");
+      };
 
       const result = yield* adapter.interruptTurn(session.threadId).pipe(Effect.result);
 
@@ -2118,8 +2136,17 @@ describe("ClaudeAdapterLive", () => {
         assert.equal(result.failure._tag, "ProviderAdapterProcessError");
       }
       assert.equal(harness.query.closeCalls, 1);
+      assert.equal(availableDuringClose, true);
+      assert.equal(sendFailedDuringClose, true);
       assert.equal(yield* adapter.hasSession(session.threadId), true);
       assert.equal((yield* adapter.listSessions())[0]?.status, "ready");
+
+      const warningFiber = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "runtime.warning" && event.payload.message === "still running",
+      ).pipe(Stream.runHead, Effect.forkChild);
+      harness.query.emit(highPriorityNotification("still running", "after-close-failure"));
+      assert.equal((yield* Fiber.join(warningFiber))._tag, "Some");
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
@@ -4691,6 +4718,61 @@ describe("ClaudeAdapterLive", () => {
           },
         });
       }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("uses result usage when authoritative context usage has no active total", () => {
+    const harness = makeHarness();
+    harness.query.stubContextUsage({
+      totalTokens: 0,
+      maxTokens: 200_000,
+      isAutoCompactEnabled: true,
+    } as SDKControlGetContextUsageResponse);
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEventsFiber = yield* Stream.takeUntil(
+        adapter.streamEvents,
+        (event) => event.type === "turn.completed",
+      ).pipe(Stream.runCollect, Effect.forkChild);
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "use result fallback",
+        attachments: [],
+      });
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        duration_ms: 1234,
+        duration_api_ms: 1200,
+        num_turns: 1,
+        result: "done",
+        stop_reason: "end_turn",
+        session_id: "sdk-session-empty-context-usage",
+        usage: {
+          input_tokens: 1_000,
+          output_tokens: 500,
+        },
+      } as unknown as SDKMessage);
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      assert.equal(harness.query.getContextUsageCalls, 1);
+      assert.deepEqual(tokenUsageEvents(runtimeEvents).at(-1)?.payload.usage, {
+        usedTokens: 1_500,
+        lastUsedTokens: 1_500,
+        inputTokens: 1_000,
+        outputTokens: 500,
+        maxTokens: 200_000,
+      });
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
