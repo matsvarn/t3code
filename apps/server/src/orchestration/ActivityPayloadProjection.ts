@@ -125,23 +125,48 @@ function projectCommandData(data: Record<string, unknown>): Record<string, unkno
   return Object.keys(projectedItem).length > 0 ? projectedItem : undefined;
 }
 
-function summarizeToolTextOutput(value: string): string | null {
-  const lines: string[] = [];
-  for (const rawLine of value.split(/\r?\n/u)) {
-    const line = rawLine.replace(/\s+/g, " ").trim();
-    if (line.length > 0) {
-      lines.push(line);
-    }
+function projectCommandValue(data: Record<string, unknown>): unknown {
+  if (data.command !== undefined) {
+    return data.command;
   }
 
-  const firstLine = lines.find((line) => line !== "```");
-  if (firstLine) {
-    return firstLine.length <= 84 ? firstLine : `${firstLine.slice(0, 83).trimEnd()}…`;
+  const input = asRecord(data.input);
+  if (input?.command !== undefined) {
+    return input.command;
   }
-  if (lines.length > 1) {
-    return `${lines.length.toLocaleString()} lines`;
+
+  const stateInput = asRecord(asRecord(data.state)?.input);
+  if (stateInput?.command !== undefined) {
+    return stateInput.command;
   }
-  return null;
+
+  return undefined;
+}
+
+function summarizeToolTextOutput(value: string): string | null {
+  let meaningfulLineCount = 0;
+  let offset = 0;
+
+  while (offset <= value.length) {
+    const newlineIndex = value.indexOf("\n", offset);
+    const lineEnd = newlineIndex === -1 ? value.length : newlineIndex;
+    const line = value.slice(offset, lineEnd).replace(/\s+/g, " ").trim();
+    if (line.length > 0) {
+      meaningfulLineCount += 1;
+      if (line !== "```") {
+        const summary = line.length <= 84 ? line : `${line.slice(0, 83).trimEnd()}…`;
+        // V8 can retain the full tool output behind a short sliced string.
+        // Join a tiny character array so the returned preview owns its bytes.
+        return Array.from(summary).join("");
+      }
+    }
+    if (newlineIndex === -1) {
+      break;
+    }
+    offset = newlineIndex + 1;
+  }
+
+  return meaningfulLineCount > 1 ? `${meaningfulLineCount.toLocaleString()} lines` : null;
 }
 
 /**
@@ -324,11 +349,17 @@ export function projectActivityPayload(
     return activity;
   }
 
+  const itemStatus = asRecord(data.item)?.status;
+  const projectedPayload =
+    payload.status === "completed" && (itemStatus === "failed" || itemStatus === "declined")
+      ? { ...payload, status: itemStatus }
+      : payload;
+
   if (payload.itemType === "mcp_tool_call") {
     return {
       ...activity,
       payload: {
-        ...payload,
+        ...projectedPayload,
         data: projectMcpToolCallData(data),
       },
     };
@@ -339,8 +370,9 @@ export function projectActivityPayload(
   if (item) {
     projectedData.item = item;
   }
-  if ("command" in data) {
-    projectedData.command = data.command;
+  const command = projectCommandValue(data);
+  if (command !== undefined) {
+    projectedData.command = command;
   }
 
   const changedFiles: string[] = [];
@@ -365,7 +397,7 @@ export function projectActivityPayload(
   return {
     ...activity,
     payload: {
-      ...payload,
+      ...projectedPayload,
       data: projectedData,
     },
   };
@@ -418,12 +450,10 @@ function dropStaleContextWindowActivities(
 }
 
 /**
- * Identity both clients use to fold a tool lifecycle row into the call it
- * belongs to (`deriveToolLifecycleCollapseKey` in web's `session-logic` and
- * mobile's `threadActivity`): an explicit `data.toolCallId` when the adapter
- * emits one, otherwise the itemType/title/detail triple. Returns null for rows
- * with no identity at all — those never collapse on the client either, so they
- * must not be dropped here.
+ * Identity used to retain only the newest lifecycle row for each call in a
+ * thread snapshot. Prefer the runtime item id, then the legacy nested id, and
+ * finally the itemType/title/detail triple. Rows without any identity remain
+ * untouched.
  */
 function toolLifecycleIdentity(activity: OrchestrationThreadActivity): string | null {
   const payload = asRecord(activity.payload);
@@ -431,7 +461,8 @@ function toolLifecycleIdentity(activity: OrchestrationThreadActivity): string | 
     return null;
   }
 
-  const toolCallId = asTrimmedString(asRecord(payload.data)?.toolCallId);
+  const toolCallId =
+    asTrimmedString(payload.toolCallId) ?? asTrimmedString(asRecord(payload.data)?.toolCallId);
   if (toolCallId) {
     return `id:${toolCallId}`;
   }
