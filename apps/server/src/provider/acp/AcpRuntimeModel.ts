@@ -513,26 +513,26 @@ function makeToolCallState(
     data.locations = input.locations;
   }
   const fallbackDetail = command ?? normalizedTitle ?? textContent;
-  const hasPresentationSeed =
-    title !== undefined ||
-    kind !== undefined ||
-    command !== undefined ||
-    normalizedTitle !== undefined ||
-    textContent !== undefined;
-  const presentation = hasPresentationSeed
-    ? deriveToolActivityPresentation({
-        itemType: canonicalItemTypeFromAcpToolKind(kind),
-        title,
-        detail: fallbackDetail,
-        data,
-        fallbackSummary: title ?? "Tool",
-      })
-    : undefined;
+  // Content text alone is tool *output*, not identity: a title-less update
+  // carrying only result text ("409 lines (truncated)") still contributes
+  // detail, but emitting its generic "Tool" summary would clobber the call's
+  // real title in mergeToolCallState.
+  const hasIdentitySeed = title !== undefined || kind !== undefined || command !== undefined;
+  const presentation =
+    hasIdentitySeed || textContent !== undefined
+      ? deriveToolActivityPresentation({
+          itemType: canonicalItemTypeFromAcpToolKind(kind),
+          title,
+          detail: fallbackDetail,
+          data,
+          fallbackSummary: title ?? "Tool",
+        })
+      : undefined;
   const status = normalizeToolCallStatus(input.status, options?.fallbackStatus);
   return {
     toolCallId,
     ...(kind ? { kind } : {}),
-    ...(presentation?.summary ? { title: presentation.summary } : {}),
+    ...(presentation && hasIdentitySeed ? { title: presentation.summary } : {}),
     ...(status ? { status } : {}),
     ...(command ? { command } : {}),
     ...(presentation?.detail ? { detail: presentation.detail } : {}),

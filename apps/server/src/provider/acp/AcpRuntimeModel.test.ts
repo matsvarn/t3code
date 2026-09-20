@@ -258,6 +258,53 @@ describe("AcpRuntimeModel", () => {
     }
   });
 
+  it("keeps the call's title when an update only carries output text", () => {
+    // Devin sends title-less tool_call_update notifications whose content is
+    // just result text ("409 lines (truncated)"); treating it as a
+    // presentation seed would replace "Read file" with a bare "Tool" label.
+    const created = parseSessionUpdateEvent({
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: "tool-2",
+        title: "Read file",
+        kind: "read",
+        status: "in_progress",
+        locations: [{ path: "/tmp/file.txt" }],
+        rawInput: { file_path: "/tmp/file.txt" },
+      },
+    } satisfies EffectAcpSchema.SessionNotification);
+    const updated = parseSessionUpdateEvent({
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tool-2",
+        status: "completed",
+        content: [
+          {
+            type: "content",
+            content: { type: "text", text: "409 lines (truncated)" },
+          },
+        ],
+      },
+    } satisfies EffectAcpSchema.SessionNotification);
+
+    const createdEvent = created.events[0];
+    const updatedEvent = updated.events[0];
+    if (createdEvent?._tag !== "ToolCallUpdated" || updatedEvent?._tag !== "ToolCallUpdated") {
+      throw new Error("expected ToolCallUpdated events");
+    }
+    expect(updatedEvent.toolCall.title).toBeUndefined();
+    expect(updatedEvent.toolCall.detail).toBe("409 lines (truncated)");
+    expect(mergeToolCallState(createdEvent.toolCall, updatedEvent.toolCall)).toMatchObject({
+      toolCallId: "tool-2",
+      status: "completed",
+      title: "Read file",
+      kind: "read",
+      detail: "409 lines (truncated)",
+    });
+  });
+
   it("trims padded current mode updates before emitting a mode change", () => {
     const result = parseSessionUpdateEvent({
       sessionId: "session-1",
