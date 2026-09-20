@@ -285,6 +285,9 @@ export function buildDevinModelsFromConfigOptions(
   registerDevinModelCatalog({
     fusionSlugs: fusionEntries.map((entry) => entry.slug),
     effortFamilies,
+    defaultFusionSlug: fusionEntries.some((entry) => entry.slug === currentValue)
+      ? currentValue
+      : fusionEntries[0]?.slug,
   });
   const fusionModel = buildDevinFusionModel(fusionEntries, currentValue);
   return fusionModel ? [fusionModel, ...models] : models;

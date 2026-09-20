@@ -220,7 +220,7 @@ describe("buildDevinModelsFromConfigOptions", () => {
         id: "model",
         name: "Model",
         type: "select",
-        currentValue: undefined,
+        currentValue: "claude-opus-4-6",
         options: [
           { value: "claude-opus-4-6", name: "Claude Opus 4.6" },
           { value: "claude-opus-4-6-1m", name: "Claude Opus 4.6 1M" },

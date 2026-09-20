@@ -312,6 +312,10 @@ let devinModelCatalog:
       readonly fusion: {
         readonly ordered: ReadonlyArray<string>;
         readonly set: ReadonlySet<string>;
+        /** The catalog's advertised fusion default — the only valid value
+         * to send when a composed slug can't be formed or matched, since
+         * bare `fusion` is not itself a dispatchable catalog entry. */
+        readonly defaultSlug: string | undefined;
       };
       readonly families: ReadonlyMap<string, DevinEffortFamily>;
     }
@@ -320,9 +324,14 @@ let devinModelCatalog:
 export function registerDevinModelCatalog(input: {
   readonly fusionSlugs: ReadonlyArray<string>;
   readonly effortFamilies: ReadonlyMap<string, DevinEffortFamily>;
+  readonly defaultFusionSlug?: string | undefined;
 }): void {
   devinModelCatalog = {
-    fusion: { ordered: input.fusionSlugs, set: new Set(input.fusionSlugs) },
+    fusion: {
+      ordered: input.fusionSlugs,
+      set: new Set(input.fusionSlugs),
+      defaultSlug: input.defaultFusionSlug,
+    },
     families: input.effortFamilies,
   };
 }
@@ -351,9 +360,9 @@ function snapDevinFusionSlug(selection: DevinFusionSelection): string {
     .filter((slug) => slug.startsWith(prefix))
     .map((slug) => slug.slice(prefix.length));
   if (tails.length === 0) {
-    // The lead+effort itself isn't advertised — defer to the agent's configured
-    // fusion default rather than guess.
-    return DEVIN_FUSION_MODEL_SLUG;
+    // The lead+effort itself isn't advertised — snap to the catalog's fusion
+    // default; bare `fusion` is rejected as a config value.
+    return catalog.defaultSlug ?? DEVIN_FUSION_MODEL_SLUG;
   }
   // Keep the lead+effort; snap the sidekick to the closest advertised one:
   // same family+effort, then same family, then the canonical swe-2-medium.
@@ -379,8 +388,8 @@ export function resolveDevinAcpBaseModelId(model: string | null | undefined): st
 /**
  * The model value sent over ACP. For the `fusion` picker entry, lead/effort/
  * sidekick selections compose the concrete slug; without a complete selection
- * the bare `fusion` family id is sent and the agent resolves the configured
- * preferred combination. For collapsed effort families the selection already
+ * the catalog's advertised fusion default is sent, since the bare `fusion`
+ * family id is rejected as a config value. For collapsed effort families the
  * carries the exact variant slug, so it dispatches verbatim (the family's
  * default covers missing or stale picks).
  */
@@ -397,7 +406,12 @@ export function resolveDevinModelSelectionValue(
     const lead = pick(DEVIN_FUSION_OPTION_IDS.lead);
     const leadEffort = pick(DEVIN_FUSION_OPTION_IDS.leadEffort);
     const sidekick = pick(DEVIN_FUSION_OPTION_IDS.sidekick);
-    return lead && sidekick ? snapDevinFusionSlug({ lead, leadEffort, sidekick }) : base;
+    if (lead && sidekick) {
+      return snapDevinFusionSlug({ lead, leadEffort, sidekick });
+    }
+    // Missing picks (e.g. a turn that resent no options): the family slug is
+    // not dispatchable, so fall back to the catalog's fusion default.
+    return devinModelCatalog?.fusion.defaultSlug ?? base;
   }
   const family = devinModelCatalog?.families.get(base);
   if (family) {

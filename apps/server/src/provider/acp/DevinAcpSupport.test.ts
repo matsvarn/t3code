@@ -233,11 +233,21 @@ describe("resolveDevinModelSelectionValue", () => {
     expect(resolveDevinModelSelectionValue(undefined, undefined)).toBe("adaptive");
   });
 
-  it("sends the bare family id when fusion options are incomplete", () => {
-    expect(resolveDevinModelSelectionValue("fusion", undefined)).toBe("fusion");
+  it("falls back to the catalog's fusion default when options are incomplete", () => {
+    registerDevinModelCatalog({
+      fusionSlugs: CATALOG,
+      effortFamilies: new Map(),
+      defaultFusionSlug: "fusion-claude-fable-5-1-medium-sidekick-swe-2-medium",
+    });
+    expect(resolveDevinModelSelectionValue("fusion", undefined)).toBe(
+      "fusion-claude-fable-5-1-medium-sidekick-swe-2-medium",
+    );
     expect(
       resolveDevinModelSelectionValue("fusion", [{ id: "lead", value: "claude-fable-5-1" }]),
-    ).toBe("fusion");
+    ).toBe("fusion-claude-fable-5-1-medium-sidekick-swe-2-medium");
+    // Without an advertised default the bare family id is the only option left.
+    registerDevinModelCatalog({ fusionSlugs: CATALOG, effortFamilies: new Map() });
+    expect(resolveDevinModelSelectionValue("fusion", undefined)).toBe("fusion");
   });
 
   it("composes lead, effort, and sidekick selections into the advertised slug", () => {
@@ -270,15 +280,19 @@ describe("resolveDevinModelSelectionValue", () => {
     ).toBe("fusion-claude-fable-5-1-medium-fast-sidekick-swe-2-medium");
   });
 
-  it("falls back to the family id when the lead+effort isn't advertised", () => {
-    registerDevinModelCatalog({ fusionSlugs: CATALOG, effortFamilies: new Map() });
+  it("falls back to the fusion default when the lead+effort isn't advertised", () => {
+    registerDevinModelCatalog({
+      fusionSlugs: CATALOG,
+      effortFamilies: new Map(),
+      defaultFusionSlug: "fusion-claude-fable-5-1-medium-sidekick-swe-2-medium",
+    });
     expect(
       resolveDevinModelSelectionValue("fusion", [
         { id: "lead", value: "claude-fable-5-1" },
         { id: "leadEffort", value: "low" },
         { id: "sidekick", value: "swe-2-medium" },
       ]),
-    ).toBe("fusion");
+    ).toBe("fusion-claude-fable-5-1-medium-sidekick-swe-2-medium");
   });
 
   it("dispatches the exact variant slug for collapsed effort families", () => {

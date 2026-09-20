@@ -127,6 +127,9 @@ interface PendingUserInput {
 interface DevinSessionContext {
   readonly threadId: ThreadId;
   session: ProviderSession;
+  /** Option picks from the last modelSelection applied to this session —
+   * turns that don't resend them still dispatch the same concrete slug. */
+  modelOptions: ReadonlyArray<ProviderOptionSelection> | undefined;
   readonly scope: Scope.Closeable;
   readonly acp: AcpSessionRuntime.AcpSessionRuntime["Service"];
   notificationFiber: Fiber.Fiber<void, never> | undefined;
@@ -694,6 +697,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           ctx = {
             threadId: input.threadId,
             session,
+            modelOptions: devinModelSelection?.options ?? undefined,
             scope: sessionScope,
             acp,
             notificationFiber: undefined,
@@ -879,6 +883,14 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           const turnModelSelection =
             input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
           const model = turnModelSelection?.model ?? ctx.session.model;
+          // Turns usually resend no options — reuse the picks the session
+          // started with so composed models (fusion) stay dispatchable. A
+          // stale pick can't leak across models: family resolution validates
+          // each option id against the family's own variant set.
+          const modelOptions = turnModelSelection?.options ?? ctx.modelOptions;
+          if (turnModelSelection) {
+            ctx.modelOptions = modelOptions;
+          }
           const resolvedModel = resolveDevinAcpBaseModelId(model);
           yield* applyRequestedSessionConfiguration({
             runtime: ctx.acp,
@@ -889,7 +901,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                 ? undefined
                 : {
                     model,
-                    options: turnModelSelection?.options,
+                    options: modelOptions,
                   },
             mapError: ({ cause, method }) =>
               mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
