@@ -103,19 +103,28 @@ export function upsertProviderWorkspaceSnapshot(
 const shouldRetainMissingProviderModels = (provider: ServerProvider): boolean => {
   const isAntigravity = provider.driver === ProviderDriverKind.make("antigravity");
   const isCodex = provider.driver === ProviderDriverKind.make("codex");
-  if (!isAntigravity && !isCodex && provider.driver !== ProviderDriverKind.make("opencode")) {
+  const isDevin = provider.driver === ProviderDriverKind.make("devin");
+  if (
+    !isAntigravity &&
+    !isCodex &&
+    !isDevin &&
+    provider.driver !== ProviderDriverKind.make("opencode")
+  ) {
     return true;
   }
 
   if (
-    (isAntigravity || isCodex) &&
+    (isAntigravity || isCodex || isDevin) &&
     (!provider.enabled || provider.auth.status === "unauthenticated")
   ) {
     return false;
   }
 
-  // Successful discovery replaces these inventories so cached retired models disappear.
-  // Antigravity's local health check does not authenticate or discover models.
+  // Successful discovery replaces these inventories so cached retired models
+  // disappear. Devin's ACP probe is authoritative the same way — without it a
+  // stale variant slug (now folded into a family's `aliases`) resurrects as a
+  // duplicate on every refresh. Antigravity's local health check does not
+  // authenticate or discover models.
   const isPendingAntigravityAuthentication =
     isAntigravity && provider.status === "warning" && provider.auth.status === "unknown";
   const isPendingInitialProbe =
@@ -156,7 +165,9 @@ const mergeProviderModels = (
       capabilities: previousModel.capabilities,
     };
   });
-  const nextSlugs = new Set(nextModels.map((model) => model.slug));
+  // A slug claimed as an alias of a fresh model is the same model under an
+  // older id — retaining the stale row would resurrect a duplicate.
+  const nextSlugs = new Set(nextModels.flatMap((model) => [model.slug, ...(model.aliases ?? [])]));
   return shouldRetainMissingModels
     ? [...mergedModels, ...retainablePreviousModels.filter((model) => !nextSlugs.has(model.slug))]
     : mergedModels;

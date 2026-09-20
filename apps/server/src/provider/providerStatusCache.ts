@@ -19,7 +19,11 @@ const mergeProviderModels = (
   fallbackModels: ReadonlyArray<ServerProvider["models"][number]>,
   cachedModels: ReadonlyArray<ServerProvider["models"][number]>,
 ): ReadonlyArray<ServerProvider["models"][number]> => {
-  const fallbackSlugs = new Set(fallbackModels.map((model) => model.slug));
+  // Aliases claim the same slugs the fallback models own, so a cached row for
+  // a collapsed variant id does not resurrect next to its family.
+  const fallbackSlugs = new Set(
+    fallbackModels.flatMap((model) => [model.slug, ...(model.aliases ?? [])]),
+  );
   // The fallback snapshot is built from current settings and already carries
   // every custom model, so cached custom rows that are not in it were removed
   // while the cache was stale and must not come back.

@@ -1081,6 +1081,77 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
         );
       });
 
+      describe("Devin model inventories", () => {
+        const cachedProvider = {
+          instanceId: ProviderInstanceId.make("devin"),
+          driver: ProviderDriverKind.make("devin"),
+          status: "ready",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          checkedAt: "2026-09-04T19:00:00.000Z",
+          version: "1.0.0",
+          // Cached before variant folding: the raw flat list.
+          models: ["swe-2-medium", "swe-2-max", "gpt-5-4"].map((slug) => ({
+            slug,
+            name: slug,
+            isCustom: false,
+            capabilities: null,
+          })),
+          slashCommands: [],
+          skills: [],
+        } satisfies ServerProvider;
+        const collapsedFamily = {
+          slug: "swe-2",
+          name: "SWE-2",
+          isCustom: false,
+          aliases: ["swe-2-medium", "swe-2-max"],
+          capabilities: null,
+        } as const;
+        const refreshedProvider = {
+          ...cachedProvider,
+          checkedAt: "2026-09-04T19:01:00.000Z",
+          models: [collapsedFamily, cachedProvider.models[2]!],
+        } satisfies ServerProvider;
+
+        it("drops stale variant rows after a successful probe", () => {
+          assert.deepStrictEqual(
+            mergeProviderSnapshot(cachedProvider, refreshedProvider).models,
+            refreshedProvider.models,
+          );
+        });
+
+        it("keeps cached models while the probe is pending or failed", () => {
+          for (const provider of [
+            {
+              ...cachedProvider,
+              status: "warning",
+              installed: false,
+              auth: { status: "unknown" },
+              models: [],
+            },
+            { ...cachedProvider, status: "error", models: [] },
+          ] satisfies ReadonlyArray<ServerProvider>) {
+            assert.deepStrictEqual(
+              mergeProviderSnapshot(cachedProvider, provider).models,
+              cachedProvider.models,
+            );
+          }
+        });
+
+        it("does not resurrect cached rows claimed as aliases on a retained merge", () => {
+          // A non-authoritative driver (always retains) whose fresh snapshot
+          // folds variants into a family: stale rows for those variant slugs
+          // are claimed by `aliases` and must not reappear.
+          const genericCached = { ...cachedProvider, driver: ProviderDriverKind.make("cursor") };
+          const genericNext = { ...refreshedProvider, driver: ProviderDriverKind.make("cursor") };
+          assert.deepStrictEqual(
+            mergeProviderSnapshot(genericCached, genericNext).models,
+            genericNext.models,
+          );
+        });
+      });
+
       describe("Antigravity model inventories", () => {
         const previousProvider = {
           instanceId: ProviderInstanceId.make("antigravity-personal"),
