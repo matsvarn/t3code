@@ -51,7 +51,7 @@ import {
   parseDevinFusionSlug,
   readDevinApiKey,
   registerDevinModelCatalog,
-  splitDevinModelEffort,
+  splitDevinModelVariant,
 } from "../acp/DevinAcpSupport.ts";
 
 const DEVIN_PRESENTATION = {
@@ -181,10 +181,12 @@ function devinModelsFromSettings(
  * them), so they're collapsed here into a single "Fusion" model whose option
  * descriptors carry lead/effort/sidekick choices. The adapter composes the
  * concrete slug from those selections at apply time. Ordinary models get the
- * same treatment one dimension down: `<base>-<effort>` variants (`swe-2-max`,
- * `claude-opus-5-high-fast`, `MODEL_GPT_5_2_LOW`) collapse into one model per
- * family with an "Effort" descriptor whose option ids are the exact variant
- * slugs.
+ * same treatment one dimension down: `<base>-<variant>` variants (`swe-2-max`,
+ * `claude-opus-5-high-fast`, `claude-opus-4-6-thinking-1m`,
+ * `MODEL_GPT_5_2_LOW`) collapse into one model per family whose descriptor —
+ * "Effort" or "Variant" — carries the exact variant slugs as option ids.
+ * Entries whose slugs are opaque (`MODEL_PRIVATE_*`) still group when their
+ * display names share a base (`GPT-5.1 * Thinking` → "GPT-5.1").
  */
 export function buildDevinModelsFromConfigOptions(
   configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption> | null | undefined,
@@ -213,7 +215,7 @@ export function buildDevinModelsFromConfigOptions(
         fusionEntries.push({ slug, name });
         continue;
       }
-      const { base } = splitDevinModelEffort(slug);
+      const { base } = splitDevinModelVariant(slug);
       const group = effortGroups.get(base);
       if (group) {
         group.push({ slug, name });
@@ -222,9 +224,44 @@ export function buildDevinModelsFromConfigOptions(
       }
     }
   }
+  // Some entries hide the variant entirely in the display name
+  // (`MODEL_PRIVATE_13` → "GPT-5.1 Low Thinking"): leftover singles that share
+  // a stripped name base collapse into a family too.
+  const nameGroups = new Map<string, Array<{ slug: string; name: string }>>();
+  for (const members of effortGroups.values()) {
+    if (members.length !== 1) continue;
+    const member = members[0]!;
+    const nameBase = devinModelNameBase(member.name);
+    const group = nameGroups.get(nameBase);
+    if (group) {
+      group.push(member);
+    } else {
+      nameGroups.set(nameBase, [member]);
+    }
+  }
+  const emitFamily = (familySlug: string, members: Array<{ slug: string; name: string }>) => {
+    models.push(buildDevinEffortFamilyModel(familySlug, members, currentValue));
+    effortFamilies.set(familySlug, {
+      defaultSlug: members.find((member) => member.slug === currentValue)?.slug ?? members[0]!.slug,
+      variants: new Set(members.map((member) => member.slug)),
+    });
+  };
+  const emittedNameGroups = new Set<string>();
+  const consumedSlugs = new Set<string>();
   for (const [base, members] of effortGroups) {
-    if (members.length === 1) {
-      const member = members[0]!;
+    if (members.length > 1) {
+      emitFamily(base, members);
+      continue;
+    }
+    const member = members[0]!;
+    if (consumedSlugs.has(member.slug)) continue;
+    const nameBase = devinModelNameBase(member.name);
+    const nameGroup = nameGroups.get(nameBase);
+    const isNameVariant =
+      nameGroup !== undefined &&
+      nameGroup.length > 1 &&
+      nameGroup.some((other) => other.name !== nameBase);
+    if (!isNameVariant || emittedNameGroups.has(nameBase)) {
       models.push({
         slug: member.slug,
         name: member.name,
@@ -234,12 +271,16 @@ export function buildDevinModelsFromConfigOptions(
       });
       continue;
     }
-    const model = buildDevinEffortFamilyModel(base, members, currentValue);
-    models.push(model);
-    effortFamilies.set(base, {
-      defaultSlug: members.find((member) => member.slug === currentValue)?.slug ?? members[0]!.slug,
-      variants: new Set(members.map((member) => member.slug)),
-    });
+    emittedNameGroups.add(nameBase);
+    // The name-derived slug is only a picker identity — dispatch always sends a
+    // member slug verbatim. If it collides with a real slug outside the group,
+    // fall back to the first member's.
+    const memberSlugs = new Set(nameGroup.map((other) => other.slug));
+    const derived = devinFamilySlug(nameBase);
+    const familySlug =
+      seen.has(derived) && !memberSlugs.has(derived) ? nameGroup[0]!.slug : derived;
+    emitFamily(familySlug, nameGroup);
+    for (const groupedMember of nameGroup) consumedSlugs.add(groupedMember.slug);
   }
   registerDevinModelCatalog({
     fusionSlugs: fusionEntries.map((entry) => entry.slug),
@@ -271,6 +312,81 @@ function devinCommonNamePrefix(names: ReadonlyArray<string>): string {
   return prefix.trimEnd();
 }
 
+/** Words stripped from display names to find a family's shared name base. */
+const DEVIN_NAME_VARIANT_PHRASES = [
+  "no thinking",
+  "thinking",
+  "minimal",
+  "medium",
+  "xhigh",
+  "x-high",
+  "none",
+  "low",
+  "high",
+  "max",
+  "fast",
+  "priority",
+  "1m",
+] as const;
+
+/** "GPT-5.1 Low Thinking" → "GPT-5.1"; returns the name unchanged when bare. */
+function devinModelNameBase(name: string): string {
+  let rest = name.trim();
+  for (;;) {
+    const lower = rest.toLowerCase();
+    const phrase = DEVIN_NAME_VARIANT_PHRASES.find((p) => lower.endsWith(` ${p}`));
+    if (!phrase) {
+      return rest;
+    }
+    rest = rest.slice(0, lower.length - phrase.length - 1).trimEnd();
+  }
+}
+
+function devinFamilySlug(nameBase: string): string {
+  return nameBase
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+const DEVIN_VARIANT_TIER_RANK: ReadonlyArray<readonly [string, number]> = [
+  ["none", 0],
+  ["no thinking", 0],
+  ["minimal", 1],
+  ["low", 2],
+  ["medium", 3],
+  ["high", 4],
+  ["xhigh", 5],
+  ["x-high", 5],
+  ["max", 6],
+];
+
+/**
+ * Sort order for a family's options: the bare/default pick first, effort tiers
+ * in ascending order (modifiers like "1M"/"Fast" after their tier), and
+ * non-effort variants last in catalog order.
+ */
+function devinVariantRank(label: string): number {
+  const lower = label.trim().toLowerCase();
+  if (lower === "") {
+    return -1;
+  }
+  for (const [tier, rank] of DEVIN_VARIANT_TIER_RANK) {
+    if (lower === tier || lower.startsWith(`${tier} `)) {
+      const modifiers = lower.slice(tier.length).trim().split(/\s+/).filter(Boolean).length;
+      return rank * 10 + modifiers;
+    }
+  }
+  return 100;
+}
+
+/**
+ * True when every member's name remainder is empty (the default) or an effort
+ * phrase, so the descriptor reads "Effort" rather than the generic "Variant".
+ */
+const DEVIN_EFFORT_LABEL_PATTERN =
+  /^(none|no thinking|minimal|low|medium|high|xhigh|x-high|max)( (thinking|fast|priority|1m))*$/i;
+
 function buildDevinEffortFamilyModel(
   base: string,
   members: ReadonlyArray<{ slug: string; name: string }>,
@@ -281,6 +397,21 @@ function buildDevinEffortFamilyModel(
     ? currentValue
     : undefined;
   const defaultSlug = activeSlug ?? members[0]!.slug;
+  const ranked = members
+    .map((member, index) => ({
+      member,
+      index,
+      label: member.name.slice(namePrefix.length).trim() || "Default",
+    }))
+    .sort((a, b) => {
+      const rankDelta =
+        devinVariantRank(a.label === "Default" ? "" : a.label) -
+        devinVariantRank(b.label === "Default" ? "" : b.label);
+      return rankDelta !== 0 ? rankDelta : a.index - b.index;
+    });
+  const isEffortFamily = ranked.every(
+    (entry) => entry.label === "Default" || DEVIN_EFFORT_LABEL_PATTERN.test(entry.label),
+  );
   return {
     slug: base,
     name: namePrefix || devinSlugLabel(base),
@@ -292,12 +423,12 @@ function buildDevinEffortFamilyModel(
       optionDescriptors: [
         {
           id: DEVIN_EFFORT_OPTION_ID,
-          label: "Effort",
+          label: isEffortFamily ? "Effort" : "Variant",
           type: "select",
-          options: members.map((member) => ({
-            id: member.slug,
-            label: member.name.slice(namePrefix.length).trim() || "Default",
-            ...(member.slug === defaultSlug ? { isDefault: true } : {}),
+          options: ranked.map((entry) => ({
+            id: entry.member.slug,
+            label: entry.label,
+            ...(entry.member.slug === defaultSlug ? { isDefault: true } : {}),
           })),
           currentValue: defaultSlug,
         },

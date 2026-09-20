@@ -218,29 +218,35 @@ export const DEVIN_FUSION_OPTION_IDS = {
 const DEVIN_FUSION_EFFORT_PATTERN = /^(none|minimal|low|medium|high|xhigh|max)(-(fast|priority))?$/;
 
 /**
- * Trailing effort token on an ordinary model slug — hyphenated efforts
- * (`claude-opus-5-high-fast`, `gpt-5-4-none`) plus the underscore-separated
- * legacy `MODEL_*` ids (`MODEL_GPT_5_2_XHIGH`). `-fast`/`-priority` only count
- * as modifiers after a real effort tier, so `swe-1-6-fast` stays a distinct
- * model rather than an effort variant.
+ * One trailing variant token on a model slug — effort tiers (`-high`,
+ * `-high-fast`, `-high-priority`, `-none`), `-thinking`, `-fast`, the `-1m`
+ * context suffix, and underscore-separated legacy `MODEL_*` tails
+ * (`MODEL_GPT_5_2_XHIGH`, `MODEL_CLAUDE_4_5_OPUS_THINKING`).
  */
-const DEVIN_EFFORT_TAIL_PATTERN =
-  /(?:-(none|minimal|low|medium|high|xhigh|max)(?:-(fast|priority))?|_(NONE|MINIMAL|LOW|MEDIUM|HIGH|XHIGH))$/i;
+const DEVIN_VARIANT_TAIL_PATTERN =
+  /(?:-(?:none|minimal|low|medium|high|xhigh|max|thinking|fast|priority|1m)|_(?:NONE|MINIMAL|LOW|MEDIUM|HIGH|XHIGH|THINKING))$/i;
 
-/** Splits `<base>-<effort>` slugs into their parts; `effort` is undefined for bare slugs. */
-export function splitDevinModelEffort(slug: string): {
+/**
+ * Strips trailing variant tokens off a model slug, iterating so stacked
+ * variants fold into their base family (`glm-5-2-max-1m` → `glm-5-2`,
+ * `claude-opus-4-6-thinking-1m` → `claude-opus-4-6`). `variant` is the stripped
+ * tail, empty for bare slugs.
+ */
+export function splitDevinModelVariant(slug: string): {
   readonly base: string;
-  readonly effort: string | undefined;
+  readonly variant: string;
 } {
-  const trimmed = slug.trim();
-  const match = DEVIN_EFFORT_TAIL_PATTERN.exec(trimmed);
-  if (!match) {
-    return { base: trimmed, effort: undefined };
+  let base = slug.trim();
+  const tokens: Array<string> = [];
+  for (;;) {
+    const match = DEVIN_VARIANT_TAIL_PATTERN.exec(base);
+    if (!match || match.index === 0) {
+      break;
+    }
+    tokens.unshift(match[0].slice(1).toLowerCase());
+    base = base.slice(0, match.index);
   }
-  const effort = match[1]
-    ? `${match[1]}${match[2] ? `-${match[2]}` : ""}`.toLowerCase()
-    : (match[3] ?? "").toLowerCase();
-  return { base: trimmed.slice(0, match.index), effort };
+  return { base, variant: tokens.join("-") };
 }
 
 export interface DevinFusionSelection {

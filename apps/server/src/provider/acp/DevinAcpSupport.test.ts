@@ -20,7 +20,7 @@ import {
   registerDevinModelCatalog,
   resolveDevinAcpBaseModelId,
   resolveDevinModelSelectionValue,
-  splitDevinModelEffort,
+  splitDevinModelVariant,
   stageDevinMcpConfig,
   makeDevinAcpRuntime,
 } from "./DevinAcpSupport.ts";
@@ -158,49 +158,63 @@ describe("composeDevinFusionSlug", () => {
   });
 });
 
-describe("splitDevinModelEffort", () => {
+describe("splitDevinModelVariant", () => {
   it("splits hyphenated effort tails, including fast/priority modifiers", () => {
-    expect(splitDevinModelEffort("claude-opus-5-high-fast")).toEqual({
+    expect(splitDevinModelVariant("claude-opus-5-high-fast")).toEqual({
       base: "claude-opus-5",
-      effort: "high-fast",
+      variant: "high-fast",
     });
-    expect(splitDevinModelEffort("gpt-5-6-sol-medium-priority")).toEqual({
+    expect(splitDevinModelVariant("gpt-5-6-sol-medium-priority")).toEqual({
       base: "gpt-5-6-sol",
-      effort: "medium-priority",
+      variant: "medium-priority",
     });
-    expect(splitDevinModelEffort("swe-2-max")).toEqual({ base: "swe-2", effort: "max" });
-    expect(splitDevinModelEffort("gpt-5-4-none")).toEqual({ base: "gpt-5-4", effort: "none" });
+    expect(splitDevinModelVariant("swe-2-max")).toEqual({ base: "swe-2", variant: "max" });
+    expect(splitDevinModelVariant("gpt-5-4-none")).toEqual({ base: "gpt-5-4", variant: "none" });
   });
 
-  it("splits underscore-separated MODEL_ effort tails", () => {
-    expect(splitDevinModelEffort("MODEL_GPT_5_2_XHIGH")).toEqual({
+  it("splits underscore-separated MODEL_ variant tails", () => {
+    expect(splitDevinModelVariant("MODEL_GPT_5_2_XHIGH")).toEqual({
       base: "MODEL_GPT_5_2",
-      effort: "xhigh",
+      variant: "xhigh",
     });
-    expect(splitDevinModelEffort("MODEL_GOOGLE_GEMINI_3_0_FLASH_MINIMAL")).toEqual({
+    expect(splitDevinModelVariant("MODEL_GOOGLE_GEMINI_3_0_FLASH_MINIMAL")).toEqual({
       base: "MODEL_GOOGLE_GEMINI_3_0_FLASH",
-      effort: "minimal",
+      variant: "minimal",
+    });
+    expect(splitDevinModelVariant("MODEL_CLAUDE_4_5_OPUS_THINKING")).toEqual({
+      base: "MODEL_CLAUDE_4_5_OPUS",
+      variant: "thinking",
     });
   });
 
-  it("leaves bare and non-effort slugs whole", () => {
-    expect(splitDevinModelEffort("adaptive")).toEqual({ base: "adaptive", effort: undefined });
-    // "-fast" alone is a model variant, not an effort tier.
-    expect(splitDevinModelEffort("swe-1-6-fast")).toEqual({
-      base: "swe-1-6-fast",
-      effort: undefined,
+  it("stacks thinking, fast, and 1m context tails onto the base", () => {
+    expect(splitDevinModelVariant("claude-opus-4-6-thinking")).toEqual({
+      base: "claude-opus-4-6",
+      variant: "thinking",
     });
-    expect(splitDevinModelEffort("claude-opus-4-6-thinking")).toEqual({
-      base: "claude-opus-4-6-thinking",
-      effort: undefined,
+    expect(splitDevinModelVariant("glm-5-2-max-1m")).toEqual({
+      base: "glm-5-2",
+      variant: "max-1m",
     });
-    expect(splitDevinModelEffort("glm-5-2-max-1m")).toEqual({
-      base: "glm-5-2-max-1m",
-      effort: undefined,
+    expect(splitDevinModelVariant("claude-sonnet-4-6-thinking-1m")).toEqual({
+      base: "claude-sonnet-4-6",
+      variant: "thinking-1m",
     });
-    expect(splitDevinModelEffort("MODEL_PRIVATE_11")).toEqual({
+    expect(splitDevinModelVariant("swe-1-6-fast")).toEqual({
+      base: "swe-1-6",
+      variant: "fast",
+    });
+  });
+
+  it("leaves bare and non-variant slugs whole", () => {
+    expect(splitDevinModelVariant("adaptive")).toEqual({ base: "adaptive", variant: "" });
+    expect(splitDevinModelVariant("MODEL_PRIVATE_11")).toEqual({
       base: "MODEL_PRIVATE_11",
-      effort: undefined,
+      variant: "",
+    });
+    expect(splitDevinModelVariant("swe-1-7-lightning")).toEqual({
+      base: "swe-1-7-lightning",
+      variant: "",
     });
   });
 });
@@ -287,6 +301,30 @@ describe("resolveDevinModelSelectionValue", () => {
   it("passes stored variant slugs through untouched", () => {
     // A thread that stored the concrete slug before the collapse keeps its pick.
     expect(resolveDevinModelSelectionValue("swe-2-medium", undefined)).toBe("swe-2-medium");
+  });
+
+  it("dispatches member slugs verbatim for name-grouped families", () => {
+    registerDevinModelCatalog({
+      fusionSlugs: [],
+      effortFamilies: new Map([
+        [
+          "gpt-5-1",
+          {
+            defaultSlug: "MODEL_PRIVATE_12",
+            variants: new Set([
+              "MODEL_PRIVATE_12",
+              "MODEL_PRIVATE_13",
+              "MODEL_PRIVATE_14",
+              "MODEL_PRIVATE_15",
+            ]),
+          },
+        ],
+      ]),
+    });
+    expect(
+      resolveDevinModelSelectionValue("gpt-5-1", [{ id: "effort", value: "MODEL_PRIVATE_14" }]),
+    ).toBe("MODEL_PRIVATE_14");
+    expect(resolveDevinModelSelectionValue("gpt-5-1", undefined)).toBe("MODEL_PRIVATE_12");
   });
 });
 

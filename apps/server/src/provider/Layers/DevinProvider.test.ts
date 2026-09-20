@@ -172,8 +172,8 @@ describe("buildDevinModelsFromConfigOptions", () => {
     expect(descriptor?.id).toBe("effort");
     expect(descriptor?.type === "select" && descriptor.currentValue).toBe("swe-2-max");
     expect(descriptor?.type === "select" && descriptor.options).toEqual([
-      { id: "swe-2-high", label: "High" },
       { id: "swe-2-medium", label: "Medium" },
+      { id: "swe-2-high", label: "High" },
       { id: "swe-2-max", label: "Max", isDefault: true },
     ]);
 
@@ -212,6 +212,100 @@ describe("buildDevinModelsFromConfigOptions", () => {
 
     const opus = models.find((model) => model.slug === "claude-opus-5")!;
     expect(opus.isDefault).toBe(true);
+  });
+
+  it("folds thinking/1M suffixes into a Variant descriptor", () => {
+    const models = buildDevinModelsFromConfigOptions([
+      {
+        id: "model",
+        name: "Model",
+        type: "select",
+        currentValue: undefined,
+        options: [
+          { value: "claude-opus-4-6", name: "Claude Opus 4.6" },
+          { value: "claude-opus-4-6-1m", name: "Claude Opus 4.6 1M" },
+          { value: "claude-opus-4-6-thinking", name: "Claude Opus 4.6 Thinking" },
+          { value: "claude-opus-4-6-thinking-1m", name: "Claude Opus 4.6 Thinking 1M" },
+          { value: "glm-5-2", name: "GLM-5.2 High" },
+          { value: "glm-5-2-1m", name: "GLM-5.2 High 1M" },
+          { value: "glm-5-2-max", name: "GLM-5.2 Max" },
+          { value: "glm-5-2-max-1m", name: "GLM-5.2 Max 1M" },
+          { value: "glm-5-2-none", name: "GLM-5.2 No Thinking" },
+          { value: "glm-5-2-none-1m", name: "GLM-5.2 No Thinking 1M" },
+        ],
+      },
+    ]);
+
+    expect(models.map((model) => model.slug)).toEqual(["claude-opus-4-6", "glm-5-2"]);
+
+    const opus = models[0]!;
+    expect(opus.name).toBe("Claude Opus 4.6");
+    const opusDescriptor = opus.capabilities?.optionDescriptors?.[0];
+    expect(opusDescriptor?.label).toBe("Variant");
+    expect(opusDescriptor?.type === "select" && opusDescriptor.options).toEqual([
+      { id: "claude-opus-4-6", label: "Default", isDefault: true },
+      { id: "claude-opus-4-6-1m", label: "1M" },
+      { id: "claude-opus-4-6-thinking", label: "Thinking" },
+      { id: "claude-opus-4-6-thinking-1m", label: "Thinking 1M" },
+    ]);
+
+    const glm = models[1]!;
+    expect(glm.name).toBe("GLM-5.2");
+    const glmDescriptor = glm.capabilities?.optionDescriptors?.[0];
+    expect(glmDescriptor?.label).toBe("Effort");
+    expect(
+      glmDescriptor?.type === "select" && glmDescriptor.options.map((option) => option.label),
+    ).toEqual(["No Thinking", "No Thinking 1M", "High", "High 1M", "Max", "Max 1M"]);
+  });
+
+  it("collapses opaque-slug variants by shared display-name base", () => {
+    const models = buildDevinModelsFromConfigOptions([
+      {
+        id: "model",
+        name: "Model",
+        type: "select",
+        currentValue: "MODEL_PRIVATE_14",
+        options: [
+          { value: "MODEL_PRIVATE_11", name: "Claude Haiku 4.5" },
+          { value: "MODEL_PRIVATE_12", name: "GPT-5.1 No Thinking" },
+          { value: "MODEL_PRIVATE_13", name: "GPT-5.1 Low Thinking" },
+          { value: "MODEL_PRIVATE_14", name: "GPT-5.1 Medium Thinking" },
+          { value: "MODEL_PRIVATE_15", name: "GPT-5.1 High Thinking" },
+          { value: "MODEL_PRIVATE_2", name: "Claude Sonnet 4.5" },
+          { value: "MODEL_PRIVATE_3", name: "Claude Sonnet 4.5 Thinking" },
+        ],
+      },
+    ]);
+
+    expect(models.map((model) => model.slug)).toEqual([
+      "MODEL_PRIVATE_11",
+      "gpt-5-1",
+      "claude-sonnet-4-5",
+    ]);
+
+    const gpt51 = models[1]!;
+    expect(gpt51.name).toBe("GPT-5.1");
+    expect(gpt51.isDefault).toBe(true);
+    expect(gpt51.aliases).toEqual([
+      "MODEL_PRIVATE_12",
+      "MODEL_PRIVATE_13",
+      "MODEL_PRIVATE_14",
+      "MODEL_PRIVATE_15",
+    ]);
+    const gpt51Descriptor = gpt51.capabilities?.optionDescriptors?.[0];
+    expect(gpt51Descriptor?.label).toBe("Effort");
+    expect(
+      gpt51Descriptor?.type === "select" && gpt51Descriptor.options.map((option) => option.id),
+    ).toEqual(["MODEL_PRIVATE_12", "MODEL_PRIVATE_13", "MODEL_PRIVATE_14", "MODEL_PRIVATE_15"]);
+
+    const sonnet = models[2]!;
+    expect(sonnet.name).toBe("Claude Sonnet 4.5");
+    const sonnetDescriptor = sonnet.capabilities?.optionDescriptors?.[0];
+    expect(sonnetDescriptor?.label).toBe("Variant");
+    expect(sonnetDescriptor?.type === "select" && sonnetDescriptor.options).toEqual([
+      { id: "MODEL_PRIVATE_2", label: "Default", isDefault: true },
+      { id: "MODEL_PRIVATE_3", label: "Thinking" },
+    ]);
   });
 
   it("flattens grouped options and ignores non-model options", () => {
