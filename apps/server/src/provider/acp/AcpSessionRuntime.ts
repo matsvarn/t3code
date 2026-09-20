@@ -11,6 +11,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
@@ -18,7 +19,7 @@ import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import * as EffectAcpClient from "effect-acp/client";
 import * as EffectAcpErrors from "effect-acp/errors";
-import type * as EffectAcpSchema from "effect-acp/schema";
+import * as EffectAcpSchema from "effect-acp/schema";
 import type * as EffectAcpProtocol from "effect-acp/protocol";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 
@@ -92,7 +93,10 @@ export interface AcpSessionRuntimeOptions {
     readonly name: string;
     readonly version: string;
   };
-  readonly authMethodId: string;
+  /** When set, `authenticate` is sent during `start()` before session setup. */
+  readonly authMethodId?: string;
+  /** Extra `_meta` fields merged into the `authenticate` request (e.g. a stored API key). */
+  readonly authenticateMeta?: { readonly [x: string]: unknown };
   readonly mcpServers?: ReadonlyArray<EffectAcpSchema.McpServer>;
   /** Extra workspace roots the agent may read and write besides `cwd`. */
   readonly additionalDirectories?: ReadonlyArray<string>;
@@ -319,6 +323,11 @@ interface AcpActivePrompt {
   readonly completed: Deferred.Deferred<void>;
 }
 
+const decodeNewSessionResponse = Schema.decodeUnknownEffect(EffectAcpSchema.NewSessionResponse);
+const decodeResumeSessionResponse = Schema.decodeUnknownEffect(
+  EffectAcpSchema.ResumeSessionResponse,
+);
+
 export const make = (
   options: AcpSessionRuntimeOptions,
 ): Effect.Effect<
@@ -488,6 +497,31 @@ export const make = (
     ).pipe(Effect.provideService(Scope.Scope, runtimeScope));
 
     const acp = yield* Effect.service(EffectAcpClient.AcpClient).pipe(Effect.provide(acpContext));
+
+    // `additionalDirectories` is a provider extension absent from the ACP spec
+    // the vendored codec was generated from — the typed RPC would silently
+    // strip it, so session setup goes over the raw transport and the response
+    // is decoded against the same schema.
+    const callSessionSetup = <A>(
+      method: string,
+      payload: unknown,
+      decode: (response: unknown) => Effect.Effect<A, Schema.SchemaError>,
+    ): Effect.Effect<A, EffectAcpErrors.AcpError> =>
+      acp.raw.request(method, payload).pipe(
+        Effect.flatMap((response) =>
+          decode(response).pipe(
+            Effect.mapError(
+              (cause) =>
+                new EffectAcpErrors.AcpTransportError({
+                  operation: "call-rpc",
+                  method,
+                  detail: "The session setup response did not match the ACP schema.",
+                  cause,
+                }),
+            ),
+          ),
+        ),
+      );
 
     const processSessionUpdate = (notification: EffectAcpSchema.SessionNotification) =>
       handleSessionUpdate({
@@ -707,15 +741,18 @@ export const make = (
     const startOnce = Effect.gen(function* () {
       const initializeResult = yield* sendInitialize;
 
-      const authenticatePayload = {
-        methodId: options.authMethodId,
-      } satisfies EffectAcpSchema.AuthenticateRequest;
+      if (options.authMethodId !== undefined) {
+        const authenticatePayload = {
+          methodId: options.authMethodId,
+          ...(options.authenticateMeta ? { _meta: options.authenticateMeta } : {}),
+        } satisfies EffectAcpSchema.AuthenticateRequest;
 
-      yield* runLoggedRequest(
-        "authenticate",
-        authenticatePayload,
-        acp.agent.authenticate(authenticatePayload),
-      );
+        yield* runLoggedRequest(
+          "authenticate",
+          authenticatePayload,
+          acp.agent.authenticate(authenticatePayload),
+        );
+      }
 
       let sessionId: string;
       let sessionSetupResult:
@@ -742,7 +779,7 @@ export const make = (
         sessionSetupResult = yield* runLoggedRequest(
           "session/resume",
           resumePayload,
-          acp.agent.resumeSession(resumePayload).pipe(
+          callSessionSetup("session/resume", resumePayload, decodeResumeSessionResponse).pipe(
             Effect.timeoutOption(options.sessionLoadTimeout ?? defaultSessionLoadTimeout),
             Effect.flatMap((result) =>
               Option.isSome(result)
@@ -843,7 +880,7 @@ export const make = (
         const created = yield* runLoggedRequest(
           "session/new",
           createPayload,
-          acp.agent.createSession(createPayload),
+          callSessionSetup("session/new", createPayload, decodeNewSessionResponse),
         );
         sessionId = created.sessionId;
         sessionSetupResult = created;

@@ -1,0 +1,490 @@
+// @effect-diagnostics nodeBuiltinImport:off - resolves the mock ACP agent script path relative to this test file.
+import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
+
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { describe, expect, it } from "@effect/vitest";
+import { ThreadId } from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
+import * as Schema from "effect/Schema";
+import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
+
+import {
+  applyDevinAcpModelSelection,
+  buildDevinAcpSpawnInput,
+  composeDevinFusionSlug,
+  devinAcpSpawnArgs,
+  parseDevinFusionSlug,
+  registerDevinModelCatalog,
+  resolveDevinAcpBaseModelId,
+  resolveDevinModelSelectionValue,
+  splitDevinModelEffort,
+  stageDevinMcpConfig,
+  makeDevinAcpRuntime,
+} from "./DevinAcpSupport.ts";
+import { execScriptSource, writeFakeCli } from "../../testUtils/fakeCli.ts";
+
+const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
+
+const DevinMcpConfigShape = Schema.Struct({
+  mcpServers: Schema.Struct({
+    "t3-code": Schema.Struct({
+      url: Schema.String,
+      transport: Schema.String,
+      headers: Schema.Struct({ Authorization: Schema.String }),
+    }),
+  }),
+});
+const decodeDevinMcpConfig = Schema.decodeUnknownEffect(Schema.fromJsonString(DevinMcpConfigShape));
+const decodeJsonLine = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+
+describe("devinAcpSpawnArgs", () => {
+  it("passes Devin's least-permissive mode for approval-required", () => {
+    expect(devinAcpSpawnArgs("approval-required")).toEqual(["--permission-mode", "auto", "acp"]);
+  });
+
+  it("maps runtime modes onto Devin permission modes", () => {
+    expect(devinAcpSpawnArgs("auto-accept-edits")).toEqual([
+      "--permission-mode",
+      "accept-edits",
+      "acp",
+    ]);
+    expect(devinAcpSpawnArgs("auto")).toEqual(["--permission-mode", "smart", "acp"]);
+    expect(devinAcpSpawnArgs("full-access")).toEqual(["--permission-mode", "dangerous", "acp"]);
+  });
+
+  it("spawns a bare acp server when no runtime mode is set", () => {
+    expect(devinAcpSpawnArgs()).toEqual(["acp"]);
+    expect(devinAcpSpawnArgs(undefined)).toEqual(["acp"]);
+  });
+
+  it("puts the agent type after the acp subcommand", () => {
+    expect(devinAcpSpawnArgs("auto", "summarizer")).toEqual([
+      "--permission-mode",
+      "smart",
+      "acp",
+      "--agent-type",
+      "summarizer",
+    ]);
+    expect(devinAcpSpawnArgs(undefined, "review")).toEqual(["acp", "--agent-type", "review"]);
+  });
+});
+
+describe("buildDevinAcpSpawnInput", () => {
+  it("defaults to `devin` on PATH and threads cwd through", () => {
+    expect(buildDevinAcpSpawnInput(null, "/tmp/work")).toEqual({
+      command: "devin",
+      args: ["acp"],
+      cwd: "/tmp/work",
+    });
+  });
+
+  it("honours a configured binary path", () => {
+    const spawn = buildDevinAcpSpawnInput(
+      { binaryPath: "/opt/devin/bin/devin" },
+      "/tmp/work",
+      undefined,
+      "full-access",
+    );
+    expect(spawn.command).toBe("/opt/devin/bin/devin");
+    expect(spawn.args).toEqual(["--permission-mode", "dangerous", "acp"]);
+  });
+});
+
+describe("resolveDevinAcpBaseModelId", () => {
+  it("falls back to Devin's adaptive router", () => {
+    expect(resolveDevinAcpBaseModelId(undefined)).toBe("adaptive");
+    expect(resolveDevinAcpBaseModelId(null)).toBe("adaptive");
+    expect(resolveDevinAcpBaseModelId("")).toBe("adaptive");
+    expect(resolveDevinAcpBaseModelId("   ")).toBe("adaptive");
+  });
+
+  it("passes explicit model slugs through", () => {
+    expect(resolveDevinAcpBaseModelId("opus")).toBe("opus");
+    expect(resolveDevinAcpBaseModelId("  sonnet-4.6  ")).toBe("sonnet-4.6");
+  });
+});
+
+describe("parseDevinFusionSlug", () => {
+  it("splits lead, effort, and sidekick out of a composed slug", () => {
+    expect(parseDevinFusionSlug("fusion-claude-fable-5-1-medium-sidekick-swe-2-medium")).toEqual({
+      lead: "claude-fable-5-1",
+      leadEffort: "medium",
+      sidekick: "swe-2-medium",
+    });
+    expect(parseDevinFusionSlug("fusion-gpt-5-6-sol-high-fast-sidekick-swe-2-high")).toEqual({
+      lead: "gpt-5-6-sol",
+      leadEffort: "high-fast",
+      sidekick: "swe-2-high",
+    });
+    expect(
+      parseDevinFusionSlug("fusion-gpt-6-astra-xhigh-sidekick-gpt-5-6-luna-high-priority"),
+    ).toEqual({
+      lead: "gpt-6-astra",
+      leadEffort: "xhigh",
+      sidekick: "gpt-5-6-luna-high-priority",
+    });
+  });
+
+  it("treats a head without an effort token as effortless", () => {
+    expect(parseDevinFusionSlug("fusion-glm-5-2-sidekick-swe-2-medium")).toEqual({
+      lead: "glm-5-2",
+      leadEffort: undefined,
+      sidekick: "swe-2-medium",
+    });
+  });
+
+  it("rejects non-fusion and malformed slugs", () => {
+    expect(parseDevinFusionSlug("adaptive")).toBeUndefined();
+    expect(parseDevinFusionSlug("fusion")).toBeUndefined();
+    expect(parseDevinFusionSlug("fusion-swe-2-medium")).toBeUndefined();
+    expect(parseDevinFusionSlug("fusion--sidekick-")).toBeUndefined();
+    expect(parseDevinFusionSlug("swe-2-medium-sidekick-fusion")).toBeUndefined();
+  });
+});
+
+describe("composeDevinFusionSlug", () => {
+  it("round-trips through parseDevinFusionSlug", () => {
+    const slug = "fusion-claude-opus-5-high-fast-sidekick-gpt-5-6-sol-high";
+    expect(composeDevinFusionSlug(parseDevinFusionSlug(slug)!)).toBe(slug);
+  });
+
+  it("omits the effort segment when the lead has none", () => {
+    expect(
+      composeDevinFusionSlug({ lead: "glm-5-2", leadEffort: undefined, sidekick: "swe-2-high" }),
+    ).toBe("fusion-glm-5-2-sidekick-swe-2-high");
+  });
+});
+
+describe("splitDevinModelEffort", () => {
+  it("splits hyphenated effort tails, including fast/priority modifiers", () => {
+    expect(splitDevinModelEffort("claude-opus-5-high-fast")).toEqual({
+      base: "claude-opus-5",
+      effort: "high-fast",
+    });
+    expect(splitDevinModelEffort("gpt-5-6-sol-medium-priority")).toEqual({
+      base: "gpt-5-6-sol",
+      effort: "medium-priority",
+    });
+    expect(splitDevinModelEffort("swe-2-max")).toEqual({ base: "swe-2", effort: "max" });
+    expect(splitDevinModelEffort("gpt-5-4-none")).toEqual({ base: "gpt-5-4", effort: "none" });
+  });
+
+  it("splits underscore-separated MODEL_ effort tails", () => {
+    expect(splitDevinModelEffort("MODEL_GPT_5_2_XHIGH")).toEqual({
+      base: "MODEL_GPT_5_2",
+      effort: "xhigh",
+    });
+    expect(splitDevinModelEffort("MODEL_GOOGLE_GEMINI_3_0_FLASH_MINIMAL")).toEqual({
+      base: "MODEL_GOOGLE_GEMINI_3_0_FLASH",
+      effort: "minimal",
+    });
+  });
+
+  it("leaves bare and non-effort slugs whole", () => {
+    expect(splitDevinModelEffort("adaptive")).toEqual({ base: "adaptive", effort: undefined });
+    // "-fast" alone is a model variant, not an effort tier.
+    expect(splitDevinModelEffort("swe-1-6-fast")).toEqual({
+      base: "swe-1-6-fast",
+      effort: undefined,
+    });
+    expect(splitDevinModelEffort("claude-opus-4-6-thinking")).toEqual({
+      base: "claude-opus-4-6-thinking",
+      effort: undefined,
+    });
+    expect(splitDevinModelEffort("glm-5-2-max-1m")).toEqual({
+      base: "glm-5-2-max-1m",
+      effort: undefined,
+    });
+    expect(splitDevinModelEffort("MODEL_PRIVATE_11")).toEqual({
+      base: "MODEL_PRIVATE_11",
+      effort: undefined,
+    });
+  });
+});
+
+describe("resolveDevinModelSelectionValue", () => {
+  const CATALOG = [
+    "fusion-claude-fable-5-1-medium-sidekick-swe-2-medium",
+    "fusion-claude-fable-5-1-medium-sidekick-swe-2-high",
+    "fusion-claude-fable-5-1-medium-fast-sidekick-swe-2-medium",
+    "fusion-claude-fable-5-1-medium-fast-sidekick-swe-2-high",
+    "fusion-gpt-6-astra-xhigh-sidekick-glm-5-2",
+  ];
+
+  it("sends non-fusion selections through untouched", () => {
+    expect(resolveDevinModelSelectionValue("swe-2-max", undefined)).toBe("swe-2-max");
+    expect(resolveDevinModelSelectionValue(undefined, undefined)).toBe("adaptive");
+  });
+
+  it("sends the bare family id when fusion options are incomplete", () => {
+    expect(resolveDevinModelSelectionValue("fusion", undefined)).toBe("fusion");
+    expect(
+      resolveDevinModelSelectionValue("fusion", [{ id: "lead", value: "claude-fable-5-1" }]),
+    ).toBe("fusion");
+  });
+
+  it("composes lead, effort, and sidekick selections into the advertised slug", () => {
+    registerDevinModelCatalog({ fusionSlugs: CATALOG, effortFamilies: new Map() });
+    expect(
+      resolveDevinModelSelectionValue("fusion", [
+        { id: "lead", value: "claude-fable-5-1" },
+        { id: "leadEffort", value: "medium" },
+        { id: "sidekick", value: "swe-2-medium" },
+      ]),
+    ).toBe("fusion-claude-fable-5-1-medium-sidekick-swe-2-medium");
+  });
+
+  it("snaps an unadvertised sidekick to the same family for that head", () => {
+    registerDevinModelCatalog({ fusionSlugs: CATALOG, effortFamilies: new Map() });
+    // medium-fast + swe-2-medium isn't advertised for this head; swe-2-high is.
+    expect(
+      resolveDevinModelSelectionValue("fusion", [
+        { id: "lead", value: "claude-fable-5-1" },
+        { id: "leadEffort", value: "medium-fast" },
+        { id: "sidekick", value: "swe-2-medium" },
+      ]),
+    ).toBe("fusion-claude-fable-5-1-medium-fast-sidekick-swe-2-medium");
+    expect(
+      resolveDevinModelSelectionValue("fusion", [
+        { id: "lead", value: "claude-fable-5-1" },
+        { id: "leadEffort", value: "medium-fast" },
+        { id: "sidekick", value: "glm-5-2" },
+      ]),
+    ).toBe("fusion-claude-fable-5-1-medium-fast-sidekick-swe-2-medium");
+  });
+
+  it("falls back to the family id when the lead+effort isn't advertised", () => {
+    registerDevinModelCatalog({ fusionSlugs: CATALOG, effortFamilies: new Map() });
+    expect(
+      resolveDevinModelSelectionValue("fusion", [
+        { id: "lead", value: "claude-fable-5-1" },
+        { id: "leadEffort", value: "low" },
+        { id: "sidekick", value: "swe-2-medium" },
+      ]),
+    ).toBe("fusion");
+  });
+
+  it("dispatches the exact variant slug for collapsed effort families", () => {
+    registerDevinModelCatalog({
+      fusionSlugs: [],
+      effortFamilies: new Map([
+        ["swe-2", { defaultSlug: "swe-2-max", variants: new Set(["swe-2-medium", "swe-2-max"]) }],
+      ]),
+    });
+    expect(
+      resolveDevinModelSelectionValue("swe-2", [{ id: "effort", value: "swe-2-medium" }]),
+    ).toBe("swe-2-medium");
+    // Missing or stale picks resolve to the family's default variant.
+    expect(resolveDevinModelSelectionValue("swe-2", undefined)).toBe("swe-2-max");
+    expect(resolveDevinModelSelectionValue("swe-2", [{ id: "effort", value: "swe-2-low" }])).toBe(
+      "swe-2-max",
+    );
+  });
+
+  it("passes stored variant slugs through untouched", () => {
+    // A thread that stored the concrete slug before the collapse keeps its pick.
+    expect(resolveDevinModelSelectionValue("swe-2-medium", undefined)).toBe("swe-2-medium");
+  });
+});
+
+describe("applyDevinAcpModelSelection", () => {
+  it.effect("dispatches the composed fusion slug through setModel", () =>
+    Effect.gen(function* () {
+      registerDevinModelCatalog({
+        fusionSlugs: ["fusion-claude-fable-5-1-high-sidekick-swe-2-high"],
+        effortFamilies: new Map(),
+      });
+      let applied: string | undefined;
+      const runtime = {
+        setModel: (model: string) => {
+          applied = model;
+          return Effect.void;
+        },
+      };
+      yield* applyDevinAcpModelSelection({
+        runtime,
+        model: "fusion",
+        selections: [
+          { id: "lead", value: "claude-fable-5-1" },
+          { id: "leadEffort", value: "high" },
+          { id: "sidekick", value: "swe-2-high" },
+        ],
+        mapError: (cause) => cause,
+      });
+      expect(applied).toBe("fusion-claude-fable-5-1-high-sidekick-swe-2-high");
+    }),
+  );
+
+  it.effect("dispatches plain model slugs unchanged", () =>
+    Effect.gen(function* () {
+      let applied: string | undefined;
+      const runtime = {
+        setModel: (model: string) => {
+          applied = model;
+          return Effect.void;
+        },
+      };
+      yield* applyDevinAcpModelSelection({
+        runtime,
+        model: "swe-2-max",
+        mapError: (cause) => cause,
+      });
+      expect(applied).toBe("swe-2-max");
+    }),
+  );
+});
+
+it.layer(NodeServices.layer)("stageDevinMcpConfig", (it) => {
+  it.effect("writes a t3-code mcp_config.local.json under a per-thread .devin directory", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const stateDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-devin-mcp-" });
+      const directory = yield* stageDevinMcpConfig(stateDir, ThreadId.make("thread-mcp-stage"), {
+        endpoint: "http://127.0.0.1:13773/mcp",
+        authorizationHeader: "Bearer t3-test-credential",
+      });
+      expect(directory).toBe(NodePath.join(stateDir, "devin-mcp", "thread-mcp-stage"));
+      const written = yield* fs.readFileString(
+        NodePath.join(directory, ".devin", "mcp_config.local.json"),
+      );
+      const parsed = yield* decodeDevinMcpConfig(written);
+      expect(parsed.mcpServers["t3-code"]).toEqual({
+        url: "http://127.0.0.1:13773/mcp",
+        transport: "http",
+        headers: { Authorization: "Bearer t3-test-credential" },
+      });
+    }),
+  );
+
+  it.effect("re-stages with the refreshed credential on restart", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const stateDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-devin-mcp-" });
+      const threadId = ThreadId.make("thread-mcp-restage");
+      yield* stageDevinMcpConfig(stateDir, threadId, {
+        endpoint: "http://127.0.0.1:13773/mcp",
+        authorizationHeader: "Bearer old-token",
+      });
+      yield* stageDevinMcpConfig(stateDir, threadId, {
+        endpoint: "http://127.0.0.1:13773/mcp",
+        authorizationHeader: "Bearer new-token",
+      });
+      const written = yield* fs.readFileString(
+        NodePath.join(
+          stateDir,
+          "devin-mcp",
+          "thread-mcp-restage",
+          ".devin",
+          "mcp_config.local.json",
+        ),
+      );
+      expect(written).toContain("Bearer new-token");
+      expect(written).not.toContain("old-token");
+    }),
+  );
+});
+
+it.layer(NodeServices.layer)("makeDevinAcpRuntime", (it) => {
+  const writeFakeDevinCli = () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-devin-acp-" });
+      const mockAgentPath = NodePath.resolve(__dirname, "../../../scripts/acp-mock-agent.ts");
+      return writeFakeCli({
+        directory: dir,
+        name: "devin",
+        source: [
+          'if (!process.argv.includes("acp")) process.exit(1);',
+          execScriptSource({ scriptPath: mockAgentPath }),
+          "",
+        ].join("\n"),
+      });
+    });
+
+  it.effect("skips authenticate entirely when no api key is provided", () =>
+    Effect.gen(function* () {
+      const devinPath = yield* writeFakeDevinCli();
+      const exit = yield* Effect.exit(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+            const acp = yield* makeDevinAcpRuntime({
+              devinSettings: { binaryPath: devinPath },
+              // The mock rejects `authenticate` — succeeding here proves the
+              // request was never sent (the browser-popup bug).
+              environment: { ...process.env, T3_ACP_FAIL_AUTHENTICATE: "1" },
+              childProcessSpawner: spawner,
+              cwd: "/tmp",
+              clientInfo: { name: "test", version: "0" },
+            });
+            yield* acp.start();
+          }),
+        ),
+      );
+      expect(Exit.isSuccess(exit)).toBe(true);
+    }),
+  );
+
+  it.effect("sends authenticate with the stored api key when provided", () =>
+    Effect.gen(function* () {
+      const devinPath = yield* writeFakeDevinCli();
+      const exit = yield* Effect.exit(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+            const acp = yield* makeDevinAcpRuntime({
+              devinSettings: { binaryPath: devinPath },
+              environment: { ...process.env, T3_ACP_FAIL_AUTHENTICATE: "1" },
+              childProcessSpawner: spawner,
+              cwd: "/tmp",
+              clientInfo: { name: "test", version: "0" },
+              devinApiKey: "devin-test-session-token",
+            });
+            yield* acp.start();
+          }),
+        ),
+      );
+      expect(Exit.isFailure(exit)).toBe(true);
+    }),
+  );
+
+  it.effect("forwards additionalDirectories to session/new", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const devinPath = yield* writeFakeDevinCli();
+      const requestLogPath = NodePath.join(
+        yield* fs.makeTempDirectoryScoped({ prefix: "t3code-devin-req-" }),
+        "requests.ndjson",
+      );
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const acp = yield* makeDevinAcpRuntime({
+            devinSettings: { binaryPath: devinPath },
+            environment: { ...process.env, T3_ACP_REQUEST_LOG_PATH: requestLogPath },
+            childProcessSpawner: spawner,
+            cwd: "/tmp",
+            clientInfo: { name: "test", version: "0" },
+            additionalDirectories: ["/t3-state/devin-mcp/thread-1"],
+          });
+          yield* acp.start();
+        }),
+      );
+      const log = yield* fs.readFileString(requestLogPath);
+      const sessionNew = log
+        .trim()
+        .split("\n")
+        .map((line) => decodeJsonLine(line))
+        .find(
+          (message): message is { method: string; params?: Record<string, unknown> } =>
+            typeof message === "object" &&
+            message !== null &&
+            (message as { method?: unknown }).method === "session/new",
+        );
+      expect(sessionNew?.params?.additionalDirectories).toEqual(["/t3-state/devin-mcp/thread-1"]);
+    }),
+  );
+});
