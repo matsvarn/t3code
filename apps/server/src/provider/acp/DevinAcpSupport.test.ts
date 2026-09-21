@@ -539,4 +539,42 @@ it.layer(NodeServices.layer)("makeDevinAcpRuntime", (it) => {
       expect(sessionNew?.params?.additionalDirectories).toEqual(["/t3-state/devin-mcp/thread-1"]);
     }),
   );
+
+  it.effect("forwards additionalDirectories to session/load", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const devinPath = yield* writeFakeDevinCli();
+      const requestLogPath = NodePath.join(
+        yield* fs.makeTempDirectoryScoped({ prefix: "t3code-devin-req-" }),
+        "requests.ndjson",
+      );
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const acp = yield* makeDevinAcpRuntime({
+            devinSettings: { binaryPath: devinPath },
+            environment: { ...process.env, T3_ACP_REQUEST_LOG_PATH: requestLogPath },
+            childProcessSpawner: spawner,
+            cwd: "/tmp",
+            clientInfo: { name: "test", version: "0" },
+            resumeSessionId: "mock-session-1",
+            additionalDirectories: ["/t3-state/devin-mcp/thread-1"],
+          });
+          yield* acp.start();
+        }),
+      );
+      const log = yield* fs.readFileString(requestLogPath);
+      const sessionLoad = log
+        .trim()
+        .split("\n")
+        .map((line) => decodeJsonLine(line))
+        .find(
+          (message): message is { method: string; params?: Record<string, unknown> } =>
+            typeof message === "object" &&
+            message !== null &&
+            (message as { method?: unknown }).method === "session/load",
+        );
+      expect(sessionLoad?.params?.additionalDirectories).toEqual(["/t3-state/devin-mcp/thread-1"]);
+    }),
+  );
 });

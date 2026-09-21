@@ -328,6 +328,7 @@ const decodeNewSessionResponse = Schema.decodeUnknownEffect(EffectAcpSchema.NewS
 const decodeResumeSessionResponse = Schema.decodeUnknownEffect(
   EffectAcpSchema.ResumeSessionResponse,
 );
+const decodeLoadSessionResponse = Schema.decodeUnknownEffect(EffectAcpSchema.LoadSessionResponse);
 
 export const make = (
   options: AcpSessionRuntimeOptions,
@@ -830,6 +831,9 @@ export const make = (
           sessionId: options.resumeSessionId,
           cwd: options.cwd,
           mcpServers: options.mcpServers ?? [],
+          ...(options.additionalDirectories && options.additionalDirectories.length > 0
+            ? { additionalDirectories: options.additionalDirectories }
+            : {}),
         } satisfies EffectAcpSchema.LoadSessionRequest;
         const sessionLoadTimeout = Duration.fromInputUnsafe(
           options.sessionLoadTimeout ?? defaultSessionLoadTimeout,
@@ -860,7 +864,7 @@ export const make = (
             gateRef: sessionLoadGateRef,
           }).pipe(Effect.forkIn(runtimeScope));
           const loaded = yield* Effect.raceFirst(
-            acp.agent.loadSession(loadPayload),
+            callSessionSetup("session/load", loadPayload, decodeLoadSessionResponse),
             Fiber.join(idleFiber),
           ).pipe(
             Effect.ensuring(Fiber.interrupt(idleFiber).pipe(Effect.ignore)),
