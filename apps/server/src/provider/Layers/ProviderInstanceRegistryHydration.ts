@@ -45,6 +45,8 @@ import {
   defaultInstanceIdForDriver,
   type ProviderInstanceConfig,
   type ProviderInstanceConfigMap,
+  ProviderDriverKind,
+  ProviderInstanceId,
   ServerSettings,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -97,6 +99,29 @@ export const deriveProviderInstanceConfigMap = (
     merged[instanceId] = {
       driver: driver.driverKind,
       config: legacyConfig,
+    };
+  }
+
+  // Devin ships two first-class targets on one driver: the local agent and
+  // the `devin acp --cloud` relay. Seed a companion instance next to the
+  // default "devin" entry so both show up in the provider picker without the
+  // user authoring a second instance. It inherits the local envelope's
+  // config (binaryPath, enabled flag, environment) and only flips `cloud`;
+  // an explicit `providerInstances["devin-cloud"]` entry always wins, same
+  // as the default-instance synthesis above.
+  const devinCloudInstanceId = ProviderInstanceId.make("devin-cloud");
+  if (!(devinCloudInstanceId in merged)) {
+    const localDevin = merged[defaultInstanceIdForDriver(ProviderDriverKind.make("devin"))];
+    const localConfig = localDevin?.config;
+    merged[devinCloudInstanceId] = {
+      driver: ProviderDriverKind.make("devin"),
+      displayName: "Devin Cloud",
+      ...(localDevin?.enabled !== undefined ? { enabled: localDevin.enabled } : {}),
+      ...(localDevin?.environment ? { environment: localDevin.environment } : {}),
+      config:
+        typeof localConfig === "object" && localConfig !== null
+          ? { ...localConfig, cloud: true }
+          : { cloud: true },
     };
   }
 
