@@ -552,19 +552,22 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           // Devin connects to session/new mcpServers but never registers their
           // tools — only mcp_config-file servers reach its callable registry.
           // Stage the t3-code server under a per-thread directory and expose it
-          // through additionalDirectories instead.
-          const devinMcpDirectory = mcpSession
-            ? yield* stageDevinMcpConfig(serverConfig.stateDir, input.threadId, mcpSession).pipe(
-                Effect.provideService(FileSystem.FileSystem, fileSystem),
-                Effect.provideService(Path.Path, path),
-                Effect.catch((cause) =>
-                  Effect.logWarning(
-                    "Failed to stage Devin MCP config; t3-code tools unavailable this session.",
-                    { cause },
-                  ).pipe(Effect.as(undefined)),
-                ),
-              )
-            : undefined;
+          // through additionalDirectories instead. Cloud sessions run in a
+          // remote sandbox: they cannot read local directories and cannot
+          // reach the loopback MCP URL, so staging is skipped there.
+          const devinMcpDirectory =
+            mcpSession && !devinSettings.cloud
+              ? yield* stageDevinMcpConfig(serverConfig.stateDir, input.threadId, mcpSession).pipe(
+                  Effect.provideService(FileSystem.FileSystem, fileSystem),
+                  Effect.provideService(Path.Path, path),
+                  Effect.catch((cause) =>
+                    Effect.logWarning(
+                      "Failed to stage Devin MCP config; t3-code tools unavailable this session.",
+                      { cause },
+                    ).pipe(Effect.as(undefined)),
+                  ),
+                )
+              : undefined;
           const acp = yield* makeDevinAcpRuntime({
             devinSettings: effectiveDevinSettings,
             ...(spawnEnvironment ? { environment: spawnEnvironment } : {}),

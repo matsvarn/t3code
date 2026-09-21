@@ -92,7 +92,8 @@ export const stageDevinMcpConfig = (
     return directory;
   });
 
-type DevinAcpRuntimeDevinSettings = Pick<DevinSettings, "binaryPath">;
+type DevinAcpRuntimeDevinSettings = Pick<DevinSettings, "binaryPath"> &
+  Partial<Pick<DevinSettings, "cloud">>;
 
 interface DevinAcpRuntimeInput extends Omit<
   AcpSessionRuntime.AcpSessionRuntimeOptions,
@@ -133,12 +134,15 @@ function devinAcpPermissionArgs(runtimeMode?: RuntimeMode): ReadonlyArray<string
 export function devinAcpSpawnArgs(
   runtimeMode?: RuntimeMode,
   agentType?: "summarizer" | "review",
+  cloud?: boolean,
 ): ReadonlyArray<string> {
   return [
     // `--permission-mode` is a global flag and must precede the `acp` subcommand.
     ...devinAcpPermissionArgs(runtimeMode),
     "acp",
-    ...(agentType ? (["--agent-type", agentType] as const) : []),
+    // `--cloud` relays ACP to Devin's cloud endpoint; `--agent-type` is a
+    // local-agent flag the relay ignores, so explicit agent types stay local.
+    ...(agentType ? (["--agent-type", agentType] as const) : cloud ? (["--cloud"] as const) : []),
   ];
 }
 
@@ -151,7 +155,7 @@ export function buildDevinAcpSpawnInput(
 ): AcpSessionRuntime.AcpSpawnInput {
   return {
     command: devinSettings?.binaryPath || "devin",
-    args: devinAcpSpawnArgs(runtimeMode, agentType),
+    args: devinAcpSpawnArgs(runtimeMode, agentType, devinSettings?.cloud === true),
     cwd,
     ...(environment ? { env: environment } : {}),
   };

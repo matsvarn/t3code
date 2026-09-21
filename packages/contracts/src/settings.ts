@@ -752,13 +752,22 @@ export const DevinSettings = makeProviderSettingsSchema(
         providerSettingsForm: { placeholder: "devin", clearWhenEmpty: "omit" },
       }),
     ),
+    cloud: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({
+        title: "Devin Cloud",
+        description:
+          "Drive Devin cloud sessions instead of the local agent. Requires `devin auth login`.",
+        providerSettingsForm: { control: "switch" },
+      }),
+    ),
     customModels: Schema.Array(CustomModelSetting).pipe(
       Schema.withDecodingDefault(Effect.succeed([])),
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
   },
   {
-    order: ["binaryPath"],
+    order: ["binaryPath", "cloud"],
   },
 );
 export type DevinSettings = typeof DevinSettings.Type;
@@ -1403,6 +1412,7 @@ const GrokSettingsPatch = Schema.Struct({
 const DevinSettingsPatch = Schema.Struct({
   enabled: Schema.optionalKey(Schema.Boolean),
   binaryPath: Schema.optionalKey(TrimmedString),
+  cloud: Schema.optionalKey(Schema.Boolean),
   customModels: Schema.optionalKey(Schema.Array(CustomModelSetting)),
 });
 

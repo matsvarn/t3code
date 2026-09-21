@@ -70,6 +70,24 @@ describe("devinAcpSpawnArgs", () => {
     ]);
     expect(devinAcpSpawnArgs(undefined, "review")).toEqual(["acp", "--agent-type", "review"]);
   });
+
+  it("relays to Devin Cloud only for the default agent", () => {
+    expect(devinAcpSpawnArgs("auto", undefined, true)).toEqual([
+      "--permission-mode",
+      "smart",
+      "acp",
+      "--cloud",
+    ]);
+    // `--agent-type` is a local-agent flag the cloud relay ignores — explicit
+    // agent types must stay local even when the instance is cloud-enabled.
+    expect(devinAcpSpawnArgs("auto", "summarizer", true)).toEqual([
+      "--permission-mode",
+      "smart",
+      "acp",
+      "--agent-type",
+      "summarizer",
+    ]);
+  });
 });
 
 describe("buildDevinAcpSpawnInput", () => {
@@ -90,6 +108,13 @@ describe("buildDevinAcpSpawnInput", () => {
     );
     expect(spawn.command).toBe("/opt/devin/bin/devin");
     expect(spawn.args).toEqual(["--permission-mode", "dangerous", "acp"]);
+  });
+
+  it("appends --cloud for cloud-enabled instances", () => {
+    expect(buildDevinAcpSpawnInput({ binaryPath: "", cloud: true }, "/tmp/work").args).toEqual([
+      "acp",
+      "--cloud",
+    ]);
   });
 });
 
