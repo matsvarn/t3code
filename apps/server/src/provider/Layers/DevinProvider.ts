@@ -704,7 +704,7 @@ const discoverDevinSlashCommandsViaAcpInitialize = (
 const discoverDevinMetadataViaAcpSession = (
   devinSettings: DevinSettings,
   environment: NodeJS.ProcessEnv,
-  apiKey: string,
+  apiKey?: string,
 ) =>
   Effect.gen(function* () {
     const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -714,7 +714,7 @@ const discoverDevinMetadataViaAcpSession = (
       childProcessSpawner,
       cwd: NodeOS.tmpdir(),
       clientInfo: { name: "t3-code-provider-probe", version: "0.0.0" },
-      devinApiKey: apiKey,
+      ...(apiKey ? { devinApiKey: apiKey } : {}),
     });
     const started = yield* acp.start();
     return {
@@ -830,14 +830,48 @@ export const checkDevinProviderStatus = Effect.fn("checkDevinProviderStatus")(fu
     });
   }
 
+  // Cloud sessions authenticate against the enterprise SSO store via
+  // `devin auth login`; the windsurf API key only covers the local agent.
+  // The cloud relay just exits with "Not logged in" on stderr, which would
+  // surface as a generic probe failure — check `auth status` up front so the
+  // provider reports the real cause. Only a positive match gates: a flaky
+  // `auth status` run still falls through to the session probe.
+  if (devinSettings.cloud) {
+    const authStatusResult = yield* runDevinCliCommand(
+      devinSettings,
+      ["auth", "status"],
+      environment,
+    ).pipe(Effect.timeoutOption(VERSION_PROBE_TIMEOUT_MS), Effect.result);
+    const authStatusOutput =
+      Result.isSuccess(authStatusResult) && Option.isSome(authStatusResult.success)
+        ? `${authStatusResult.success.value.stdout}\n${authStatusResult.success.value.stderr}`
+        : "";
+    if (/not logged in/i.test(authStatusOutput)) {
+      return buildServerProvider({
+        presentation: DEVIN_PRESENTATION,
+        enabled: devinSettings.enabled,
+        checkedAt,
+        models: fallbackModels,
+        probe: {
+          installed: true,
+          version,
+          status: "error",
+          auth: { status: "unauthenticated" },
+          message:
+            "Devin Cloud requires `devin auth login` — the Devin API key only covers local sessions.",
+        },
+      });
+    }
+  }
+
   // Devin's ACP server is the sole credential source in ACP mode: local CLI
   // credentials are not picked up implicitly — the host must call `authenticate`.
   // With no stored token, calling it would start a browser login, which a
   // background probe must never do, so the credentials file gates the session
   // probe. Slash commands still come from `initialize`, which needs no auth.
-  const apiKey = yield* readDevinApiKey(environment);
+  const apiKey = devinSettings.cloud ? Option.none<string>() : yield* readDevinApiKey(environment);
 
-  if (Option.isNone(apiKey)) {
+  if (Option.isNone(apiKey) && !devinSettings.cloud) {
     const initExit = yield* discoverDevinSlashCommandsViaAcpInitialize(
       devinSettings,
       environment,
@@ -864,7 +898,7 @@ export const checkDevinProviderStatus = Effect.fn("checkDevinProviderStatus")(fu
   const acpExit = yield* discoverDevinMetadataViaAcpSession(
     devinSettings,
     environment,
-    apiKey.value,
+    Option.getOrUndefined(apiKey),
   ).pipe(Effect.timeoutOption(DEVIN_ACP_SESSION_PROBE_TIMEOUT_MS), Effect.exit);
 
   const acpMetadata = Exit.isSuccess(acpExit) ? Option.getOrUndefined(acpExit.value) : undefined;

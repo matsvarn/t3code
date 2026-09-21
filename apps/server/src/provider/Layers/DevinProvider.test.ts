@@ -409,7 +409,8 @@ it.layer(NodeServices.layer)("checkDevinProviderStatus", (it) => {
 
   // A stand-in for the Devin CLI: `version` prints canned output and `acp`
   // execs the mock ACP agent so initialize/authenticate/session/new work.
-  const writeFakeDevinCli = (input: { readonly acp: boolean }) =>
+  // `cloudLoggedIn` adds an `auth status` handler for the cloud gate.
+  const writeFakeDevinCli = (input: { readonly acp: boolean; readonly cloudLoggedIn?: boolean }) =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-devin-probe-" });
@@ -422,6 +423,16 @@ it.layer(NodeServices.layer)("checkDevinProviderStatus", (it) => {
           '  process.stdout.write("devin 3000.10.31 (abcdef)\\n");',
           "  process.exit(0);",
           "}",
+          ...(input.cloudLoggedIn === undefined
+            ? []
+            : [
+                'if (process.argv[2] === "auth" && process.argv[3] === "status") {',
+                input.cloudLoggedIn
+                  ? '  process.stdout.write("Logged in as dev@example.com\\n");'
+                  : '  process.stdout.write("Not logged in.\\n");',
+                "  process.exit(0);",
+                "}",
+              ]),
           'if (!process.argv.includes("acp")) process.exit(1);',
           ...(input.acp ? [execScriptSource({ scriptPath: mockAgentPath })] : ["process.exit(3);"]),
           "",
@@ -530,6 +541,49 @@ it.layer(NodeServices.layer)("checkDevinProviderStatus", (it) => {
       expect(snapshot.models.map((model) => model.slug)).toEqual(["adaptive"]);
       expect(snapshot.message).toContain("ACP session probe failed");
       expect(snapshot.slashCommands.map((command) => command.name)).toEqual(["compact"]);
+    }),
+  );
+
+  it.effect("reports cloud instances as needing devin auth login, not the API key", () =>
+    Effect.gen(function* () {
+      const snapshot = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const { devinPath } = yield* writeFakeDevinCli({
+            acp: true,
+            cloudLoggedIn: false,
+          });
+          // No credentials.toml — the API key must not gate cloud probes.
+          const fs = yield* FileSystem.FileSystem;
+          const dataDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-devin-xdg-" });
+          return yield* checkDevinProviderStatus(
+            decodeDevinSettings({ enabled: true, binaryPath: devinPath, cloud: true }),
+            { ...process.env, XDG_DATA_HOME: dataDir },
+          );
+        }),
+      );
+
+      expect(snapshot.status).toBe("error");
+      expect(snapshot.auth.status).toBe("unauthenticated");
+      expect(snapshot.message).toContain("devin auth login");
+    }),
+  );
+
+  it.effect("probes cloud sessions without an API key once logged in", () =>
+    Effect.gen(function* () {
+      const snapshot = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const { devinPath } = yield* writeFakeDevinCli({ acp: true, cloudLoggedIn: true });
+          const fs = yield* FileSystem.FileSystem;
+          const dataDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-devin-xdg-" });
+          return yield* checkDevinProviderStatus(
+            decodeDevinSettings({ enabled: true, binaryPath: devinPath, cloud: true }),
+            { ...process.env, XDG_DATA_HOME: dataDir },
+          );
+        }),
+      );
+
+      expect(snapshot.status).toBe("ready");
+      expect(snapshot.models.map((model) => model.slug)).toContain("default");
     }),
   );
 });

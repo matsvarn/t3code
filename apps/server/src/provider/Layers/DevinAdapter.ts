@@ -543,12 +543,16 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
               : undefined;
           // A stored token authenticates via `_meta.api_key`; without one we
           // skip `authenticate` rather than trigger its PKCE browser flow.
-          const devinApiKey = Option.getOrUndefined(
-            yield* readDevinApiKey(spawnEnvironment ?? process.env).pipe(
-              Effect.provideService(FileSystem.FileSystem, fileSystem),
-              Effect.provideService(Path.Path, path),
-            ),
-          );
+          // Cloud sessions authenticate through `devin auth login` instead —
+          // the local API key is a local-agent extension and is not sent.
+          const devinApiKey = devinSettings.cloud
+            ? undefined
+            : Option.getOrUndefined(
+                yield* readDevinApiKey(spawnEnvironment ?? process.env).pipe(
+                  Effect.provideService(FileSystem.FileSystem, fileSystem),
+                  Effect.provideService(Path.Path, path),
+                ),
+              );
           // Devin connects to session/new mcpServers but never registers their
           // tools — only mcp_config-file servers reach its callable registry.
           // Stage the t3-code server under a per-thread directory and expose it
