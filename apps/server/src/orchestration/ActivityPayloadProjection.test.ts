@@ -195,6 +195,32 @@ describe("projectActivityPayload", () => {
     expect(textRead.payload).not.toMatchObject({ data: { imagePath: expect.anything() } });
   });
 
+  it("keeps ACP read image paths from rawInput and locations", () => {
+    const imagePath = "/workspace/assets/preview.png";
+    const fromRawInput = projectActivityPayload(
+      activity({
+        itemType: "dynamic_tool_call",
+        data: { kind: "read", rawInput: { file_path: imagePath } },
+      }),
+    );
+    const fromLocations = projectActivityPayload(
+      activity({
+        itemType: "dynamic_tool_call",
+        data: { kind: "read", locations: [{ path: imagePath }] },
+      }),
+    );
+    const textRead = projectActivityPayload(
+      activity({
+        itemType: "dynamic_tool_call",
+        data: { kind: "read", rawInput: { file_path: "/workspace/src/index.ts" } },
+      }),
+    );
+
+    expect(fromRawInput.payload).toMatchObject({ data: { imagePath } });
+    expect(fromLocations.payload).toMatchObject({ data: { imagePath } });
+    expect(textRead.payload).not.toMatchObject({ data: { imagePath: expect.anything() } });
+  });
+
   it("slims Codex-shaped mcp_tool_call items to rendered fields plus a result summary", () => {
     const projected = projectActivityPayload(
       activity({

@@ -2700,6 +2700,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
                 "codex",
                 "cursor",
                 "devin",
+                "devin-cloud",
                 "grok",
                 "opencode",
               ]);

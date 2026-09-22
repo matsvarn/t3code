@@ -153,12 +153,35 @@ function projectViewedImagePath(data: Record<string, unknown>): string | undefin
   }
 
   const toolName = asTrimmedString(data.toolName)?.toLowerCase();
-  if (toolName !== "read" && toolName !== "read file") {
+  const isReadCall = toolName === "read" || toolName === "read file" || data.kind === "read";
+  if (!isReadCall) {
     return undefined;
   }
   const input = asRecord(data.input);
   const inputPath = asTrimmedString(input?.file_path) ?? asTrimmedString(input?.path);
-  return inputPath && isWorkspaceImagePreviewPath(inputPath) ? inputPath : undefined;
+  if (inputPath && isWorkspaceImagePreviewPath(inputPath)) {
+    return inputPath;
+  }
+
+  // ACP providers carry the tool input as rawInput and the touched file as
+  // locations[].path rather than toolName + input.
+  const rawInput = asRecord(data.rawInput);
+  const rawPath =
+    asTrimmedString(rawInput?.file_path) ??
+    asTrimmedString(rawInput?.path) ??
+    asTrimmedString(rawInput?.filePath);
+  if (rawPath && isWorkspaceImagePreviewPath(rawPath)) {
+    return rawPath;
+  }
+  if (Array.isArray(data.locations)) {
+    for (const location of data.locations) {
+      const locationPath = asTrimmedString(asRecord(location)?.path);
+      if (locationPath && isWorkspaceImagePreviewPath(locationPath)) {
+        return locationPath;
+      }
+    }
+  }
+  return undefined;
 }
 
 function summarizeToolTextOutput(value: string): string | null {

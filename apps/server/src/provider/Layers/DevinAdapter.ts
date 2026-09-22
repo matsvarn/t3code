@@ -73,6 +73,8 @@ import {
   resolveDevinAcpBaseModelId,
   stageDevinMcpConfig,
 } from "../acp/DevinAcpSupport.ts";
+import { hasDevinSkillMention, rewriteDevinSkillMentions } from "../Drivers/DevinSkillDispatch.ts";
+import { discoverDevinSkills } from "../Drivers/DevinSkills.ts";
 import { type DevinAdapterShape } from "../Services/DevinAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
@@ -127,6 +129,9 @@ interface PendingUserInput {
 interface DevinSessionContext {
   readonly threadId: ThreadId;
   session: ProviderSession;
+  readonly cwd: string;
+  readonly devinSettings: DevinSettings;
+  readonly spawnEnvironment: NodeJS.ProcessEnv | undefined;
   /** Option picks from the last modelSelection applied to this session —
    * turns that don't resend them still dispatch the same concrete slug. */
   modelOptions: ReadonlyArray<ProviderOptionSelection> | undefined;
@@ -704,6 +709,9 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           ctx = {
             threadId: input.threadId,
             session,
+            cwd,
+            devinSettings: effectiveDevinSettings,
+            spawnEnvironment,
             modelOptions: devinModelSelection?.options ?? undefined,
             scope: sessionScope,
             acp,
@@ -935,7 +943,28 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
           }
 
           const promptParts: Array<EffectAcpSchema.ContentBlock> = [];
-          const rawPrompt = input.input?.trim() ?? "";
+          let rawPrompt = input.input?.trim() ?? "";
+          if (hasDevinSkillMention(rawPrompt)) {
+            // Devin expands `/name` anywhere in a prompt but treats `$name` as
+            // literal text, so composer skill mentions are rewritten before
+            // dispatch. The CLI's own listing is the name source — it is
+            // cwd-scoped and cheap enough to re-read per prompt.
+            const skills = yield* discoverDevinSkills(
+              ctx.devinSettings,
+              ctx.cwd,
+              ctx.spawnEnvironment ?? process.env,
+            ).pipe(
+              Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
+            );
+            rawPrompt = rewriteDevinSkillMentions(
+              rawPrompt,
+              new Set(
+                skills
+                  .filter((skill) => skill.enabled && skill.userInvocable !== false)
+                  .map((skill) => skill.name),
+              ),
+            );
+          }
           if (rawPrompt) {
             promptParts.push({ type: "text", text: rawPrompt });
           }

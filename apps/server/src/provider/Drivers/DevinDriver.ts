@@ -39,6 +39,7 @@ import {
   type ProviderDriver,
   type ProviderInstance,
 } from "../ProviderDriver.ts";
+import { discoverDevinSkills } from "./DevinSkills.ts";
 import { withInstanceIdentity } from "./instanceIdentity.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
 import {
@@ -189,6 +190,19 @@ export const DevinDriver: ProviderDriver<DevinSettings, DevinDriverEnv> = {
         ),
       );
 
+      // Skills are workspace-scoped (`.devin/skills`, `.agents/skills`, …), so
+      // each cwd gets its own listing via `devin skills list`.
+      const snapshotForCwd = (cwd: string) =>
+        !effectiveConfig.enabled
+          ? snapshot.getSnapshot
+          : Effect.all([
+              snapshot.getSnapshot,
+              discoverDevinSkills(effectiveConfig, cwd, processEnv),
+            ]).pipe(
+              Effect.map(([machineSnapshot, skills]) => ({ ...machineSnapshot, skills })),
+              Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            );
+
       return {
         instanceId,
         driverKind: DRIVER_KIND,
@@ -197,6 +211,7 @@ export const DevinDriver: ProviderDriver<DevinSettings, DevinDriverEnv> = {
         accentColor,
         enabled,
         snapshot,
+        snapshotForCwd,
         adapter,
         textGeneration,
       } satisfies ProviderInstance;
