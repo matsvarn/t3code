@@ -76,11 +76,12 @@ The most common defect in this repo is a change that works on the path you teste
 
 ## Dev servers
 
-- `vp i` installs. Worktrees get this from the t3.json setup script; if module resolution looks broken, it probably did not run.
+- `bash scripts/setup.sh` installs through `vp i --frozen-lockfile` and warms the web dependency cache on macOS and Linux. Import the `t3.json` actions for each project/environment. Setup Worktree waits before the agent starts. It does not start servers or link credentials.
 - `vp run dev` starts server and web. In a worktree, state defaults to that worktree's gitignored `.t3`, which deliberately outranks an ambient `T3CODE_HOME` so you cannot land on shared state by accident. An explicit `--home-dir` still wins.
 - Ports derive from the worktree path and are stable across restarts, but read the real ones from the `[dev-runner]` line since occupied ports shift.
 - Sharing over the tailnet is three steps: run `vp run dev --share` in the background, wait for the `pairingUrl:` line in its output, then give that full URL to an unpaired browser. Do not wire up `tailscale serve` by hand, open the URL yourself, or consume the user's pairing link. A browser with the reusable dev cookie can use the bare origin. If a normal one-time token was consumed, mint a fresh one with `node apps/server/src/bin.ts pair`. It carries standard scopes, while the startup URL carries admin scopes needed for Connections settings.
-- To reuse web dev auth across worktrees, configure one fixed `T3CODE_DEV_AUTH_TOKEN` in the main checkout's gitignored `.env`. The `t3.json` setup links that file into worktrees. Never commit or publish the token or a startup URL. See [Reusable dev credential](docs/operations/development.md#reusable-dev-credential).
+- Reusable web dev auth is an explicit opt-in. Automatic setup leaves `.env` and relay credentials alone. Configure the environment for that checkout only when needed, and never commit or publish a token or startup URL. See [Reusable dev credential](docs/operations/development.md#reusable-dev-credential).
+- Give independent work separate branches and worktrees. Keep dependencies, state and test outputs in each checkout. Transfer commits across machines with Git; project grouping does not synchronize files. The manual Check setup and dev isolation action runs the scripts typecheck and dev-runner tests; CI owns the full suite.
 - Stop what you started, by the PID you tracked. See rule 1.
 
 ## Test data

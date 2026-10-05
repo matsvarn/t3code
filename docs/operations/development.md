@@ -6,9 +6,11 @@ Install `vp` using the [root README](../../README.md#install-vp). The checkout r
 Bun is optional. From the repository root:
 
 ```sh
-vp i
+bash scripts/setup.sh
 vp run dev
 ```
+
+Setup uses the frozen native lockfile and warms each checkout's web cache. It leaves credentials and databases alone. Import `t3.json` actions into each project/environment to run Setup Worktree automatically and wait before the agent starts. The existing Windows setup remains a manual action and has not been verified here.
 
 Open the pairing URL printed by the dev runner. The bare origin does not authenticate
 a new browser.
@@ -76,9 +78,10 @@ Put that value in the main checkout's gitignored `.env`:
 T3CODE_DEV_AUTH_TOKEN=<the value generated above>
 ```
 
-The `t3.json` Setup Worktree commands on Unix and Windows link that file to each worktree's
-`.env`. The dev runner reads repository env files at startup. `.env.local` and inherited process
-environment values override `.env`, so no per-worktree export is needed after setup.
+Automatic Unix setup does not link this file or relay credentials. Reusing credentials
+requires an explicit per-checkout choice. The manual Windows action retains its existing
+links. The dev runner reads repository env files at startup; `.env.local` and inherited
+process environment values override `.env`.
 
 For a manual worktree or launcher without that link, export the same fixed value instead:
 
