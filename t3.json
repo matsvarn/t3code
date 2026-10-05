@@ -17,7 +17,7 @@
     },
     {
       "name": "Check setup and dev isolation",
-      "command": "vp run --filter @t3tools/scripts typecheck && vp test run scripts/dev-runner.test.ts",
+      "command": "export PATH=\"$HOME/.local/share/vite-plus/bin:$HOME/.vite-plus/bin:$PATH\"; vp run --filter @t3tools/scripts typecheck && vp test run scripts/dev-runner.test.ts",
       "icon": "test",
       "runOnWorktreeCreate": false
     }

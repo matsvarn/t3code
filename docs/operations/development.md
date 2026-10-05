@@ -3,12 +3,14 @@
 ## First checkout
 
 Install `vp` using the [root README](../../README.md#install-vp). The checkout requires Node 24;
-Bun is optional. From the repository root:
+Bun is optional. Linux also needs C/C++ build tools and Python 3 for node-pty. On Ubuntu or Debian, install them once with `sudo apt-get install build-essential python3`. Setup reports missing tools and never runs sudo. From the repository root:
 
 ```sh
 bash scripts/setup.sh
 vp run dev
 ```
+
+Setup also recognizes the standard Vite+ install paths when an IDE has an older PATH. Install the host tool separately with the README command; setup never installs it for you.
 
 Setup uses the frozen native lockfile and warms each checkout's web cache. It leaves credentials and databases alone. Import `t3.json` actions into each project/environment to run Setup Worktree automatically and wait before the agent starts. The existing Windows setup remains a manual action and has not been verified here.
 
