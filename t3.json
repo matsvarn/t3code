@@ -4,15 +4,23 @@
   "scripts": [
     {
       "name": "Setup Worktree",
-      "command": "vp i && ln -sf $T3CODE_PROJECT_ROOT/.env .env && ln -sf $T3CODE_PROJECT_ROOT/infra/relay/.env infra/relay/.env && node apps/web/scripts/warm-dep-cache.ts",
+      "command": "bash scripts/setup.sh",
       "icon": "configure",
-      "runOnWorktreeCreate": true
+      "runOnWorktreeCreate": true,
+      "async": false
     },
     {
       "name": "Setup Worktree (Windows)",
       "command": "vp i && New-Item -ItemType SymbolicLink -Path .env -Target \"$env:T3CODE_PROJECT_ROOT\\.env\" -Force && New-Item -ItemType SymbolicLink -Path \"infra\\relay\\.env\" -Target \"$env:T3CODE_PROJECT_ROOT\\infra\\relay\\.env\" -Force && node apps\\web\\scripts\\warm-dep-cache.ts",
       "icon": "configure",
-      "runOnWorktreeCreate": true
+      "runOnWorktreeCreate": false
+    },
+    {
+      "name": "Check setup and dev isolation",
+      "command": "export PATH=\"$HOME/.local/share/vite-plus/bin:$HOME/.vite-plus/bin:$PATH\"; vp run --filter @t3tools/scripts typecheck && vp test run scripts/dev-runner.test.ts",
+      "icon": "test",
+      "runOnWorktreeCreate": false
     }
-  ]
+  ],
+  "defaultThreadEnvMode": "worktree"
 }
