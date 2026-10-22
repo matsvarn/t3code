@@ -84,7 +84,7 @@ minimumReleaseAgeExclude:
   - expo-updates@57.0.19
   - expo@57.0.18
   - expo-widgets@57.0.15
-  - electron@44.4.2
+  - electron@44.9.1
   - "@anthropic-ai/claude-agent-sdk@0.3.276"
   - "@alchemy.run/cloudflare-runtime@2.0.0-beta.79"
   - "@alchemy.run/floci@2.0.0-beta.79"
