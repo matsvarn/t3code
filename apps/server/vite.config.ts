@@ -38,7 +38,7 @@ const packExecutable = process.env.T3CODE_PACK_EXE === "1";
 // The Node inside the executable is pinned here rather than taken from the
 // build host, so every archive of a release embeds the same runtime no matter
 // which Node happens to run the build.
-const SEA_NODE_VERSION = "26.8.2";
+const SEA_NODE_VERSION = "26.12.1";
 const SEA_TARGETS = {
   "darwin-arm64": { platform: "darwin", arch: "arm64" },
   "darwin-x64": { platform: "darwin", arch: "x64" },

@@ -412,7 +412,7 @@ jobs:
           # The exact version, not a major: vp downloads it from nodejs.org/dist on
           # the runner, and only exact versions have a dist directory. Keep in
           # step with SEA_NODE_VERSION in apps/server/vite.config.ts.
-          VP_NODE_VERSION: "26.8.2"
+          VP_NODE_VERSION: "26.12.1"
         run: node apps/server/scripts/cli.ts build-exe --verbose
 
       - name: Import macOS signing certificate for the CLI archive
